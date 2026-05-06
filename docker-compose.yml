@@ -1,0 +1,104 @@
+services:
+  warp:
+    image: caomingjun/warp:latest
+    restart: unless-stopped
+    environment:
+      WARP_SLEEP: 2
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "${WARP_HOST:-0.0.0.0}:${WARP_HOST_PORT:-1080}:1080"
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    restart: unless-stopped
+    shm_size: 1gb
+    depends_on:
+      - warp
+
+  grok2api:
+    build:
+      context: ./vendor/grok2api
+      dockerfile: Dockerfile
+    image: grok2api-upstream:latest
+    environment:
+      TZ: Asia/Shanghai
+      DATA_DIR: /app/data
+      LOG_DIR: /app/logs
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: 8000
+      SERVER_WORKERS: 1
+      GROK2API_APP_KEY: ${GROK2API_APP_KEY:-change-this-admin-password}
+      GROK2API_API_KEY: ${GROK2API_API_KEY:-}
+      GROK2API_PROXY_MODE: ${GROK2API_PROXY_MODE:-single_proxy}
+      GROK2API_BASE_PROXY_URL: ${GROK2API_BASE_PROXY_URL:-socks5://warp:1080}
+      GROK2API_ASSET_PROXY_URL: ${GROK2API_ASSET_PROXY_URL:-socks5://warp:1080}
+      GROK2API_CLEARANCE_MODE: ${GROK2API_CLEARANCE_MODE:-flaresolverr}
+      FLARESOLVERR_URL: ${FLARESOLVERR_URL:-http://flaresolverr:8191}
+      CF_REFRESH_INTERVAL: ${CF_REFRESH_INTERVAL:-600}
+      CF_TIMEOUT: ${CF_TIMEOUT:-60}
+    command:
+      - sh
+      - -c
+      - |
+        if [ ! -s /app/data/config.toml ]; then
+        cat >/app/data/config.toml <<EOF
+        [app]
+        app_key = "${GROK2API_APP_KEY:-change-this-admin-password}"
+        api_key = "${GROK2API_API_KEY:-}"
+
+        [features]
+        temporary = true
+        memory = false
+        stream = true
+        thinking = true
+
+        [proxy.egress]
+        mode = "${GROK2API_PROXY_MODE:-single_proxy}"
+        proxy_url = "${GROK2API_BASE_PROXY_URL:-socks5://warp:1080}"
+        resource_proxy_url = "${GROK2API_ASSET_PROXY_URL:-socks5://warp:1080}"
+
+        [proxy.clearance]
+        mode = "${GROK2API_CLEARANCE_MODE:-flaresolverr}"
+        flaresolverr_url = "${FLARESOLVERR_URL:-http://flaresolverr:8191}"
+        refresh_interval = ${CF_REFRESH_INTERVAL:-600}
+        timeout_sec = ${CF_TIMEOUT:-60}
+        EOF
+        fi
+        exec granian --interface asgi --host "$${SERVER_HOST:-0.0.0.0}" --port "$${SERVER_PORT:-8000}" --workers "$${SERVER_WORKERS:-1}" app.main:app
+    ports:
+      - "${GROK2API_HOST_PORT:-8000}:8000"
+    volumes:
+      - ./runtime/grok2api/data:/app/data
+      - ./runtime/grok2api/logs:/app/logs
+    restart: unless-stopped
+    depends_on:
+      - warp
+      - flaresolverr
+
+  console:
+    build:
+      context: .
+      dockerfile: apps/worker-runtime/Dockerfile
+    working_dir: /workspace
+    command: python /workspace/apps/console/app.py
+    environment:
+      GROK_REGISTER_SOURCE_DIR: /workspace
+      GROK_REGISTER_PYTHON: /usr/local/bin/python
+      GROK_REGISTER_CONSOLE_HOST: 0.0.0.0
+      GROK_REGISTER_CONSOLE_PORT: ${GROK_STACK_CONSOLE_PORT:-18600}
+      GROK_REGISTER_CONSOLE_MAX_CONCURRENT_TASKS: 1
+      GROK_REGISTER_DEFAULT_RUN_COUNT: ${GROK_REGISTER_DEFAULT_RUN_COUNT:-50}
+      GROK_REGISTER_DEFAULT_PROXY: ${GROK_REGISTER_DEFAULT_PROXY:-socks5://warp:1080}
+      GROK_REGISTER_DEFAULT_BROWSER_PROXY: ${GROK_REGISTER_DEFAULT_BROWSER_PROXY:-socks5://warp:1080}
+      GROK_REGISTER_DEFAULT_API_ENDPOINT: ${GROK_REGISTER_DEFAULT_API_ENDPOINT:-http://grok2api:8000/admin/api/tokens/add}
+      GROK_REGISTER_DEFAULT_API_TOKEN: ${GROK_REGISTER_DEFAULT_API_TOKEN:-change-this-admin-password}
+      GROK_REGISTER_DEFAULT_API_APPEND: ${GROK_REGISTER_DEFAULT_API_APPEND:-true}
+    ports:
+      - "${GROK_STACK_CONSOLE_PORT:-18600}:18600"
+    volumes:
+      - .:/workspace
+    restart: unless-stopped
+    depends_on:
+      - grok2api
+      - warp
