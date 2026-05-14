@@ -31,7 +31,7 @@
 
 ```bash
 git clone https://github.com/bohu-t/grok2apiwarp-auto.git
-cd grok-register
+cd grok2apiwarp-auto
 cp .env.example .env
 docker compose up -d --build
 ```
