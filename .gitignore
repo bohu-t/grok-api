@@ -6,6 +6,7 @@ chrome_data/
 apps/console/runtime/
 apps/console/.venv/
 runtime/
+!vendor/grok2api/app/platform/runtime/
 config.json
 config.json.bak-*
 node_modules/
