@@ -30,8 +30,8 @@
 推荐第一次使用直接走 Docker。
 
 ```bash
-git clone https://github.com/509992828/grok-register.git
-cd grok-register
+git clone https://github.com/bohu-t/grok2apiwarp-auto.git
+cd grok2apiwarp-auto
 cp .env.example .env
 docker compose up -d --build
 ```
