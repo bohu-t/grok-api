@@ -82,6 +82,24 @@
 - 可以显式填写你想用的域名
 - 也可以留空，执行器会自动从 DuckMail 域名列表里挑一个公开、已验证域名
 
+也可以在这个字段里填多个域名，使用逗号、分号、空格或换行分隔：
+
+```text
+a.example.com,b.example.com c.example.com
+```
+
+执行器每次创建邮箱时会从这些域名里随机选择一个。
+
+## temp_mail_domains
+
+可选字段，等价于在 `temp_mail_domain` 里写多个域名，但更适合 JSON 配置：
+
+```json
+"temp_mail_domains": ["a.example.com", "b.example.com"]
+```
+
+如果同时配置 `temp_mail_domains` 和 `temp_mail_domain`，执行器会合并去重后随机选择。
+
 ## temp_mail_site_password
 
 有些临时邮箱 API 除了管理口令，还会要求站点级鉴权；如果你的接口没有这个要求，留空即可。

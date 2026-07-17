@@ -1,21 +1,8 @@
 services:
-  warp:
-    image: caomingjun/warp:latest
-    restart: unless-stopped
-    environment:
-      WARP_SLEEP: 2
-    cap_add:
-      - NET_ADMIN
-    ports:
-      - "${WARP_HOST:-0.0.0.0}:${WARP_HOST_PORT:-1080}:1080"
-
   flaresolverr:
     image: ghcr.io/flaresolverr/flaresolverr:latest
     restart: unless-stopped
     shm_size: 1gb
-    depends_on:
-      - warp
-
   grok2api:
     build:
       context: ./vendor/grok2api
@@ -73,7 +60,6 @@ services:
       - ./runtime/grok2api/logs:/app/logs
     restart: unless-stopped
     depends_on:
-      - warp
       - flaresolverr
 
   console:
@@ -101,4 +87,3 @@ services:
     restart: unless-stopped
     depends_on:
       - grok2api
-      - warp

@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+
+  
+  <script>
+  /* g2a-asset-boot v2: recover at most once; never spin-reload forever */
+  (function () {
+    var KEY = "g2a_asset_reload_at";
+    function reloadedRecently() {
+      try { return (Date.now() - Number(sessionStorage.getItem(KEY) || 0)) < 60000; } catch (e) { return false; }
+    }
+    function markReload() {
+      try { sessionStorage.setItem(KEY, String(Date.now())); } catch (e) {}
+    }
+    window.__g2aScriptFailed = function (el) {
+      console.error("static script failed", el && el.src);
+      if (!reloadedRecently()) {
+        markReload();
+        var u = new URL(location.href);
+        u.searchParams.set("_g2a_cb", String(Date.now()));
+        location.replace(u.pathname + u.search);
+        return;
+      }
+      var d = document.getElementById("boot-desc") || document.getElementById("boot-hint");
+      if (d) d.textContent = "静态资源加载失败，请点击重试";
+    };
+    window.__g2aBootLogin = function () {
+      function show(msg) {
+        try {
+          var boot = document.getElementById("boot-view");
+          var auth = document.getElementById("auth-view");
+          if (boot) boot.classList.remove("hidden");
+          if (auth) auth.classList.add("hidden");
+          var d = document.getElementById("boot-desc");
+          var h = document.getElementById("boot-hint");
+          if (d) d.textContent = "页面脚本未就绪";
+          if (h) h.innerHTML = (msg || "") +
+            '<br><button type="button" class="g2a-btn g2a-btn-primary" style="margin-top:12px" id="g2a-reload-btn">重试</button>';
+          var b = document.getElementById("g2a-reload-btn");
+          if (b) b.onclick = function () {
+            try { sessionStorage.removeItem(KEY); } catch (e) {}
+            location.replace(location.pathname + "?_g2a_cb=" + Date.now());
+          };
+        } catch (e) {}
+      }
+      // Wait a tick for deferred scripts; do NOT auto-reload unless scripts truly missing after short wait.
+      var tries = 0;
+      function attempt() {
+        tries += 1;
+        if (window.G2A && typeof G2A.api === "function" && G2A.auth && typeof G2A.auth.initLoginPage === "function") {
+          try { G2A.auth.initLoginPage(); } catch (e) { show(String(e && e.message || e)); }
+          return;
+        }
+        if (tries < 20) { setTimeout(attempt, 50); return; } // ~1s wait for script parse
+        show("登录脚本加载不完整。点击重试。");
+      }
+      attempt();
+    };
+  })();
+  </script>
+
+
+
+  <script>
+    // g2a-paint-lock: keep first paint continuous; never leave a blank black document.
+    (function () {
+      try {
+        var t = localStorage.getItem("g2a_theme");
+        if (t !== "light" && t !== "dark") {
+          t = (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) ? "light" : "dark";
+        }
+        document.documentElement.setAttribute("data-theme", t);
+        document.documentElement.style.colorScheme = t;
+        document.documentElement.style.background = t === "light" ? "#f5f7fb" : "#0a0a0f";
+        var tok = localStorage.getItem("g2a_admin_token") || "";
+        var ts = Number(localStorage.getItem("g2a_admin_token_ts") || 0) || 0;
+        var grace = tok && ts && (Date.now() - ts) < 7 * 24 * 3600 * 1000;
+        if (tok || grace) document.documentElement.classList.add("g2a-has-session");
+      } catch (e) {}
+      // Safety: if soft-nav busy class somehow persisted via bfcache, clear on pageshow.
+      window.addEventListener("pageshow", function () {
+        try { document.body && document.body.classList.remove("g2a-softnav-busy"); } catch (_) {}
+      });
+      // If scripts hang, unstick busy dimmer after 12s.
+      setTimeout(function () {
+        try { document.body && document.body.classList.remove("g2a-softnav-busy"); } catch (_) {}
+      }, 12000);
+    })();
+  </script>
+
+
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>注册任务 · grokcli-2api</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
+  <link rel="stylesheet" href="/static/dist/admin-antd.1031c5bb2f.css" />
+  <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
+
+</head>
+<body class="g2a-body" data-page="registerTasks">
+  <div id="toast" class="g2a-message"></div>
+  <div class="g2a-layout" id="main-view">
+    <aside class="g2a-sider">
+      <div class="g2a-brand">
+        <div class="g2a-logo">G</div>
+        <div>
+          <div class="g2a-brand-title">grokcli-2api</div>
+          <div class="g2a-brand-sub"><span id="app-version">…</span> · Admin</div>
+        </div>
+      </div>
+      <nav class="g2a-menu">
+        <a class="g2a-menu-item " href="/admin" data-page="overview"><span class="g2a-menu-ico">◫</span><span>概览</span></a>
+        <a class="g2a-menu-item " href="/admin/keys" data-page="keys"><span class="g2a-menu-ico">🔑</span><span>API Keys</span></a>
+        <a class="g2a-menu-item " href="/admin/accounts" data-page="accounts"><span class="g2a-menu-ico">👥</span><span>账号 / 轮询</span></a>
+        <a class="g2a-menu-item is-active" href="/admin/register-tasks" data-page="registerTasks"><span class="g2a-menu-ico">🧩</span><span>任务页</span></a>
+        <a class="g2a-menu-item " href="/admin/usage" data-page="usage"><span class="g2a-menu-ico">Σ</span><span>用量</span></a>
+        <a class="g2a-menu-item " href="/admin/logs" data-page="logs"><span class="g2a-menu-ico">📜</span><span>任务日志</span></a>
+        <a class="g2a-menu-item " href="/admin/models" data-page="models"><span class="g2a-menu-ico">▣</span><span>模型</span></a>
+        <a class="g2a-menu-item " href="/admin/settings" data-page="settings"><span class="g2a-menu-ico">⚙</span><span>系统设置</span></a>
+        <a class="g2a-menu-item " href="/admin/guide" data-page="guide"><span class="g2a-menu-ico">📘</span><span>接入指南</span></a>
+      </nav>
+      <div class="g2a-sider-foot">
+        <a href="/docs" target="_blank" rel="noopener">Swagger</a>
+        <a href="/health" target="_blank" rel="noopener">Health</a>
+        <a href="/metrics" target="_blank" rel="noopener">Metrics</a>
+        <button type="button" class="g2a-btn g2a-btn-default g2a-btn-block" id="btn-logout">退出登录</button>
+      </div>
+    </aside>
+    <div class="g2a-main">
+      <header class="g2a-header">
+        <div>
+          <h1 id="page-title">注册任务</h1>
+          <p id="page-sub">当前 grok2apiwarp-auto 自动注册任务、日志与 HM 导入状态</p>
+        </div>
+        <div class="g2a-header-actions">
+          <span id="status-pill" class="g2a-tag">—</span>
+          <button type="button" class="g2a-theme-toggle" data-theme-toggle aria-label="切换主题"><span class="ico">☀️</span><span class="label">白天</span></button>
+          <button type="button" class="g2a-btn g2a-btn-default" id="btn-refresh">刷新</button>
+        </div>
+      </header>
+      <div class="g2a-mobile-nav" id="mobile-nav"></div>
+      <div class="g2a-content">
+
+<section class="g2a-card" id="local-register-tasks-card">
+  <div class="g2a-card-head">
+    <div>
+      <h3>注册任务</h3>
+      <p>使用当前 grok2apiwarp-auto 的自动注册任务：临时邮箱、多域名随机选择、过盾、SSO 导出，并在任务完成后导入 HM 账号池。</p>
+    </div>
+    <div class="g2a-actions">
+      <button class="g2a-btn g2a-btn-default" id="task-save-settings" type="button">保存配置</button>
+      <button class="g2a-btn g2a-btn-default" id="task-refresh" type="button">刷新任务</button>
+      <button class="g2a-btn g2a-btn-primary" id="task-create" type="button" onclick="window.__localCreateTask && window.__localCreateTask(event)">新建任务</button>
+    </div>
+  </div>
+
+  <div class="g2a-form-grid">
+    <div class="g2a-field">
+      <label for="task-name">任务名称</label>
+      <input id="task-name" placeholder="例如：注册 50 个账号" autocomplete="off" />
+    </div>
+    <div class="g2a-field">
+      <label for="task-count">数量</label>
+      <input id="task-count" type="number" min="1" max="5000" value="50" />
+    </div>
+    <div class="g2a-field g2a-field-span2">
+      <label for="task-temp-mail-api-base">临时邮箱 API Base</label>
+      <input id="task-temp-mail-api-base" placeholder="https://api.duckmail.sbs" autocomplete="off" />
+    </div>
+    <div class="g2a-field g2a-field-span2">
+      <label for="task-temp-mail-domain">邮箱域名（支持多域名）</label>
+      <textarea id="task-temp-mail-domain" rows="2" placeholder="a.example.com, b.example.com 或每行一个域名" spellcheck="false"></textarea>
+      <p class="g2a-muted" style="margin:4px 0 0">逗号、空格、分号、换行都能分隔；每次创建邮箱随机选择一个域名。</p>
+    </div>
+    <div class="g2a-field">
+      <label for="task-temp-mail-admin-password">邮箱管理员密码</label>
+      <input id="task-temp-mail-admin-password" type="password" autocomplete="off" placeholder="留空使用设置页已保存值" />
+    </div>
+    <div class="g2a-field">
+      <label for="task-temp-mail-site-password">邮箱站点密码</label>
+      <input id="task-temp-mail-site-password" type="password" autocomplete="off" placeholder="留空使用设置页已保存值" />
+    </div>
+    <div class="g2a-field g2a-field-span2">
+      <label for="task-browser-proxy">浏览器代理</label>
+      <input id="task-browser-proxy" placeholder="socks5://warp:1080" autocomplete="off" />
+    </div>
+    <div class="g2a-field g2a-field-span2">
+      <label for="task-proxy">请求代理</label>
+      <textarea id="task-proxy" rows="2" placeholder="可选；留空使用设置页默认代理" spellcheck="false"></textarea>
+    </div>
+    <div class="g2a-field g2a-field-span2">
+      <label for="task-notes">备注</label>
+      <input id="task-notes" placeholder="可选" autocomplete="off" />
+    </div>
+  </div>
+
+  <div id="task-message" class="g2a-muted" style="margin:10px 0">—</div>
+  <div class="g2a-table-wrap">
+    <table class="g2a-table">
+      <thead>
+        <tr>
+          <th>ID</th><th>任务</th><th>状态</th><th>进度</th><th>最后邮箱</th><th>HM 导入</th><th>时间</th><th>操作</th>
+        </tr>
+      </thead>
+      <tbody id="task-tbody"><tr><td colspan="8" class="g2a-muted">加载中...</td></tr></tbody>
+    </table>
+  </div>
+  <div id="task-log-card" class="g2a-subcard hidden" hidden style="margin-top:12px">
+    <div class="g2a-card-head">
+      <div><h3 id="task-log-title">任务日志</h3><p id="task-log-sub">—</p></div>
+      <div class="g2a-actions">
+        <button class="g2a-btn g2a-btn-default" id="task-log-refresh" type="button">刷新日志</button>
+        <button class="g2a-btn g2a-btn-default" id="task-log-close" type="button">关闭</button>
+      </div>
+    </div>
+    <pre id="task-log" class="g2a-log">—</pre>
+  </div>
+</section>
+</div>
+    </div>
+  </div>
+  <script src="/static/dist/utils.360f09cd20.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/api.c4edde3d16.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/auth.fa7b1e0e4d.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.d60204b9f3.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/admin-task-bridge.js?v=20260717-1737" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+</body>
+</html>

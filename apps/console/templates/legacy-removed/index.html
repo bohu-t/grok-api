@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>任务 · Grok Register Console</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <div id="app" class="shell">
+    <header class="topbar topbar-compact">
+      <div class="brand">
+        <div class="brand-kicker">Task Console</div>
+        <h1>Grok Register</h1>
+        <p>任务和实时日志放在同一个页面；注册成功后自动导入 HM，探测 grok-4.5，并删除 Access denied/屏蔽账号。</p>
+      </div>
+      <nav class="nav-actions">
+        <a class="button button-secondary" href="/admin/accounts">账号</a>
+        <a class="button button-secondary" href="/settings">设置</a>
+        <a class="button button-secondary" href="/logout">退出</a>
+      </nav>
+    </header>
+
+    <main class="main task-page">
+      <section class="panel panel-create">
+        <div class="panel-head">
+          <div>
+            <div class="eyebrow">Create Task</div>
+            <h2>新建注册任务</h2>
+            <p class="panel-desc">这里只创建任务。代理、邮箱、CLIProxyAPI 等配置都在设置页维护。</p>
+          </div>
+          <button id="refreshBtn" class="button button-secondary" type="button">刷新</button>
+        </div>
+        <form id="taskForm" class="task-form compact-form">
+          <label>
+            <span>任务名称</span>
+            <input name="name" required placeholder="例如 batch-01">
+          </label>
+          <label>
+            <span>执行次数</span>
+            <input name="count" type="number" min="1" max="5000" required>
+          </label>
+          <div class="form-actions">
+            <button class="button" type="submit">创建任务</button>
+            <div id="formMessage" class="form-message"></div>
+          </div>
+        </form>
+      </section>
+
+      <section class="task-workbench">
+        <aside class="panel panel-tasks">
+          <div class="panel-head tight">
+            <div>
+              <div class="eyebrow">Tasks</div>
+              <h2>任务</h2>
+            </div>
+          </div>
+          <div id="taskList" class="task-list"></div>
+        </aside>
+
+        <section class="panel panel-detail">
+          <div class="panel-head">
+            <div>
+              <div class="eyebrow">Live Detail</div>
+              <h2 id="detailTitle">实时日志</h2>
+            </div>
+            <div class="detail-actions">
+              <button id="stopBtn" class="button button-danger" type="button" disabled>停止任务</button>
+            </div>
+          </div>
+          <div id="detailSummary" class="summary-grid"></div>
+          <div id="detailMeta" class="detail-grid"></div>
+          <div class="console-wrap">
+            <div class="console-head">任务日志</div>
+            <pre id="consoleOutput" class="console-output">选择任务后显示输出</pre>
+          </div>
+        </section>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    window.__DEFAULTS__ = {{ defaults|safe }};
+  </script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

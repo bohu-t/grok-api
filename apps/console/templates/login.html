@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>登录 · Grok Register Console</title>
+  <link rel="stylesheet" href="/static/auth.css">
+</head>
+<body class="auth-body">
+  <main class="auth-shell">
+    <section class="auth-card">
+      <div class="brand-kicker">Private Console</div>
+      <h1>{{ '设置登录密码' if setup_required else '登录控制台' }}</h1>
+      <p>{{ '首次使用需要先设置一个控制台密码。之后访问任务和设置页都需要登录。' if setup_required else '输入控制台密码后进入任务面板。' }}</p>
+      <form id="loginForm" class="task-form auth-form" method="post">
+        <label class="full">
+          <span>密码</span>
+          <input name="password" type="password" minlength="8" required autocomplete="current-password" autofocus>
+        </label>
+        {% if setup_required %}
+        <label class="full">
+          <span>确认密码</span>
+          <input name="confirm_password" type="password" minlength="8" required autocomplete="new-password">
+        </label>
+        {% endif %}
+        <div class="form-actions full">
+          <button class="button" type="submit">{{ '保存并登录' if setup_required else '登录' }}</button>
+          <div id="loginMessage" class="form-message"></div>
+        </div>
+      </form>
+    </section>
+  </main>
+  <script src="/static/auth.js"></script>
+</body>
+</html>

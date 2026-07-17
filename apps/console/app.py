@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import base64
+import hashlib
+import hmac
+import secrets
 import os
 import re
 import shutil
@@ -14,15 +18,17 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import requests
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi import Request
 from pydantic import BaseModel, Field
+
+from cpa_sso_importer import import_sso_text
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -38,10 +44,15 @@ SOURCE_VENV_PYTHON = Path(
 ).expanduser()
 MAX_CONCURRENT_TASKS = max(1, int(os.getenv("GROK_REGISTER_CONSOLE_MAX_CONCURRENT_TASKS", "1")))
 SUPERVISOR_INTERVAL = max(1.0, float(os.getenv("GROK_REGISTER_CONSOLE_POLL_INTERVAL", "2")))
+CPA_AUTH_DIR = Path(os.getenv("CPA_AUTH_DIR", "/vol2/1000/docker/cpaapi/auths")).expanduser()
+SESSION_COOKIE = "grok_console_session"
+HM_ADMIN_COOKIE = "g2a_admin"
+SESSION_MAX_AGE = int(os.getenv("CONSOLE_SESSION_MAX_AGE", "86400"))
 
 PROJECT_FILES = ("DrissionPage_example.py", "email_register.py")
 PROJECT_DIRS = ("turnstilePatch",)
 
+STATUS_CREATING = "creating"
 STATUS_QUEUED = "queued"
 STATUS_RUNNING = "running"
 STATUS_STOPPING = "stopping"
@@ -133,6 +144,20 @@ def init_db() -> None:
             );
             """
         )
+        for ddl in (
+            "ALTER TABLE tasks ADD COLUMN cpa_import_status TEXT",
+            "ALTER TABLE tasks ADD COLUMN cpa_imported_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE tasks ADD COLUMN cpa_import_failed_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE tasks ADD COLUMN cpa_import_last_error TEXT",
+            "ALTER TABLE tasks ADD COLUMN cpa_import_at TEXT",
+            "ALTER TABLE tasks ADD COLUMN hm_import_processed_count INTEGER NOT NULL DEFAULT 0",
+        ):
+            try:
+                conn.execute(ddl)
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
+        conn.commit()
 
 
 def load_source_defaults() -> dict[str, Any]:
@@ -151,6 +176,7 @@ def load_source_defaults() -> dict[str, Any]:
                 "temp_mail_api_base": "",
                 "temp_mail_admin_password": "",
                 "temp_mail_domain": "",
+                "temp_mail_domains": [],
                 "temp_mail_site_password": "",
                 "api": {"endpoint": "", "token": "", "append": True},
             }
@@ -168,6 +194,7 @@ def load_source_defaults() -> dict[str, Any]:
         "temp_mail_api_base": "GROK_REGISTER_DEFAULT_TEMP_MAIL_API_BASE",
         "temp_mail_admin_password": "GROK_REGISTER_DEFAULT_TEMP_MAIL_ADMIN_PASSWORD",
         "temp_mail_domain": "GROK_REGISTER_DEFAULT_TEMP_MAIL_DOMAIN",
+        "temp_mail_domains": "GROK_REGISTER_DEFAULT_TEMP_MAIL_DOMAINS",
         "temp_mail_site_password": "GROK_REGISTER_DEFAULT_TEMP_MAIL_SITE_PASSWORD",
     }
     for key, env_name in env_map.items():
@@ -175,20 +202,35 @@ def load_source_defaults() -> dict[str, Any]:
         if value is not None:
             base[key] = value
 
-    api_base = dict(base.get("api") or {})
-    api_env_map = {
-        "endpoint": "GROK_REGISTER_DEFAULT_API_ENDPOINT",
-        "token": "GROK_REGISTER_DEFAULT_API_TOKEN",
-    }
-    for key, env_name in api_env_map.items():
-        value = os.getenv(env_name)
-        if value is not None:
-            api_base[key] = value
-    append_env = os.getenv("GROK_REGISTER_DEFAULT_API_APPEND")
-    if append_env is not None:
-        api_base["append"] = append_env.strip().lower() in {"1", "true", "yes", "on"}
-    base["api"] = api_base
+    base["api"] = {"endpoint": "", "token": "", "append": True}
     return base
+
+
+def split_mail_domains(value: Any) -> list[str]:
+    if isinstance(value, str):
+        raw_items = re.split(r"[,;\s]+", value)
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = []
+        for item in value:
+            raw_items.extend(re.split(r"[,;\s]+", str(item or "")))
+    elif value is None:
+        raw_items = []
+    else:
+        raw_items = re.split(r"[,;\s]+", str(value))
+
+    domains: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        domain = str(item or "").strip().lstrip("@")
+        key = domain.lower()
+        if key and key not in seen:
+            domains.append(domain)
+            seen.add(key)
+    return domains
+
+
+def format_mail_domains(value: Any) -> str:
+    return ", ".join(split_mail_domains(value))
 
 
 def _mask_proxy(proxy_url: str) -> str:
@@ -245,9 +287,9 @@ def run_health_checks() -> dict[str, Any]:
 
     browser_proxy = str(defaults.get("browser_proxy", "") or "").strip()
     request_proxy = str(defaults.get("proxy", "") or "").strip()
-    api_conf = dict(defaults.get("api") or {})
-    api_endpoint = str(api_conf.get("endpoint", "") or "").strip()
     temp_mail_api_base = str(defaults.get("temp_mail_api_base", "") or "").strip()
+    cpa_conf = dict(defaults.get("cpa") or {})
+    cpa_url = str(cpa_conf.get("url", "") or "").strip()
 
     warp_target = browser_proxy or request_proxy
     if not warp_target:
@@ -298,42 +340,42 @@ def run_health_checks() -> dict[str, Any]:
                 )
             )
 
-    if not api_endpoint:
+    if not cpa_url:
         items.append(
             _build_health_item(
-                "grok2api",
-                "grok2api Sink",
+                "cpa",
+                "CLIProxyAPI",
                 False,
-                "未配置 token sink",
-                "当前系统默认配置里没有 `api.endpoint`，注册成功后不会自动入池。",
+                "未配置 CPA 地址",
+                "注册完成后需要 CLIProxyAPI URL + Management Key 才能自动导入。",
                 "-",
             )
         )
     else:
-        try:
-            response = _request_with_optional_proxy(api_endpoint, timeout=15)
-            ok = response.status_code in {200, 401, 403, 405}
-            items.append(
-                _build_health_item(
-                    "grok2api",
-                    "grok2api Sink",
-                    ok,
-                    f"HTTP {response.status_code}",
-                    "接口已可达。即使返回 401/403，也说明服务本身在线，只是需要正确的管理口令。",
-                    api_endpoint,
-                )
+        items.append(
+            _build_health_item(
+                "cpa",
+                "CLIProxyAPI",
+                True,
+                "已配置远程导入地址",
+                "为避免错误 Key 触发远端限制，这里只检查地址是否已保存；真实导入时再使用 Management Key。",
+                cpa_url,
             )
-        except Exception as exc:
-            items.append(
-                _build_health_item(
-                    "grok2api",
-                    "grok2api Sink",
-                    False,
-                    "接口不可达",
-                    f"访问 `{api_endpoint}` 失败：{exc}",
-                    api_endpoint,
-                )
-            )
+        )
+
+    hm_conf = dict(defaults.get("hm") or {})
+    hm_url = str(hm_conf.get("url", "") or "").strip()
+    hm_password_saved = bool(hm_conf.get("admin_password_saved"))
+    items.append(
+        _build_health_item(
+            "hm",
+            "HM grokcli-2api",
+            bool(hm_url and hm_password_saved),
+            "已配置筛号入口" if hm_url and hm_password_saved else "未完整配置 HM 筛号入口",
+            "任务完成后会把 SSO 导入 HM，探测 grok-4.5，并删除 Access denied/屏蔽账号。",
+            hm_url or "-",
+        )
+    )
 
     if not temp_mail_api_base:
         items.append(
@@ -425,9 +467,6 @@ class TaskCreate(BaseModel):
     temp_mail_admin_password: str | None = None
     temp_mail_domain: str | None = None
     temp_mail_site_password: str | None = None
-    api_endpoint: str | None = None
-    api_token: str | None = None
-    api_append: bool | None = None
     notes: str = ""
 
 
@@ -438,9 +477,22 @@ class SystemSettings(BaseModel):
     temp_mail_admin_password: str = ""
     temp_mail_domain: str = ""
     temp_mail_site_password: str = ""
-    api_endpoint: str = ""
-    api_token: str = ""
-    api_append: bool = True
+    cpa_url: str = ""
+    cpa_management_key: str = ""
+    hm_url: str = ""
+    hm_admin_password: str = ""
+    hm_probe_model: str = "grok-4.5"
+
+
+class CpaSsoImportRequest(BaseModel):
+    sso_text: str = Field(..., min_length=1)
+    auth_dir: str | None = None
+    cpa_url: str | None = None
+    management_key: str | None = None
+    remote_import: bool | None = None
+    workers: int = Field(2, ge=1, le=6)
+    backup: bool = True
+    dry_run: bool = False
 
 
 @dataclass
@@ -450,8 +502,9 @@ class ManagedProcess:
     log_handle: Any
 
 
-def read_settings() -> dict[str, Any]:
-    row = fetch_one("SELECT value FROM settings WHERE key = ?", ("system",))
+
+def _json_setting(key: str) -> dict[str, Any]:
+    row = fetch_one("SELECT value FROM settings WHERE key = ?", (key,))
     if not row:
         return {}
     try:
@@ -461,16 +514,251 @@ def read_settings() -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def write_settings(settings: SystemSettings) -> dict[str, Any]:
-    data = settings.model_dump()
+def _write_json_setting(key: str, value: dict[str, Any]) -> None:
     execute(
         """
         INSERT INTO settings (key, value, updated_at)
         VALUES (?, ?, ?)
         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
         """,
-        ("system", json.dumps(data, ensure_ascii=False), now_iso()),
+        (key, json.dumps(value, ensure_ascii=False), now_iso()),
     )
+
+
+def auth_config() -> dict[str, Any]:
+    cfg = _json_setting("auth")
+    if not cfg.get("session_secret"):
+        cfg["session_secret"] = secrets.token_urlsafe(32)
+        _write_json_setting("auth", cfg)
+    return cfg
+
+
+def auth_setup_required() -> bool:
+    if os.getenv("CONSOLE_PASSWORD"):
+        return False
+    cfg = auth_config()
+    return not bool(cfg.get("password_hash") and cfg.get("salt"))
+
+
+def hash_password(password: str, salt: str) -> str:
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 200_000).hex()
+
+
+def save_console_password(password: str) -> None:
+    salt = secrets.token_urlsafe(18)
+    cfg = auth_config()
+    cfg.update({"salt": salt, "password_hash": hash_password(password, salt), "updated_at": now_iso()})
+    _write_json_setting("auth", cfg)
+
+
+def verify_console_password(password: str) -> bool:
+    env_password = os.getenv("CONSOLE_PASSWORD")
+    if env_password:
+        return hmac.compare_digest(password, env_password)
+    cfg = auth_config()
+    salt = str(cfg.get("salt") or "")
+    stored = str(cfg.get("password_hash") or "")
+    if not salt or not stored:
+        return False
+    return hmac.compare_digest(hash_password(password, salt), stored)
+
+
+def sign_session(ts: str) -> str:
+    secret = str(auth_config().get("session_secret") or "")
+    return hmac.new(secret.encode(), f"console:{ts}".encode(), hashlib.sha256).hexdigest()
+
+
+def make_session_cookie() -> str:
+    ts = str(int(time.time()))
+    return f"{ts}:{sign_session(ts)}"
+
+
+def valid_session_cookie(value: str | None) -> bool:
+    if not value or ":" not in value:
+        return False
+    ts, sig = value.split(":", 1)
+    if not ts.isdigit():
+        return False
+    if int(time.time()) - int(ts) > SESSION_MAX_AGE:
+        return False
+    return hmac.compare_digest(sig, sign_session(ts))
+
+
+def request_has_console_session(request: Request) -> bool:
+    return valid_session_cookie(request.cookies.get(SESSION_COOKIE)) or valid_session_cookie(request.cookies.get(HM_ADMIN_COOKIE))
+
+
+def set_console_session_cookies(response: Response) -> None:
+    value = make_session_cookie()
+    response.set_cookie(SESSION_COOKIE, value, max_age=SESSION_MAX_AGE, httponly=True, samesite="lax", path="/")
+    response.set_cookie(HM_ADMIN_COOKIE, value, max_age=SESSION_MAX_AGE, httponly=True, samesite="lax", path="/")
+
+
+def _ensure_console_auth(request: Request) -> None:
+    if not request_has_console_session(request):
+        raise HTTPException(status_code=401, detail="Login required")
+
+
+def _hm_auth_headers(password: str) -> dict[str, str]:
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    if password:
+        headers.update({
+            "Authorization": f"Bearer {password}",
+            "X-Admin-Password": password,
+            "X-Admin-Token": password,
+            "X-API-Key": password,
+            "X-Api-Key": password,
+        })
+    return headers
+
+
+def _hm_base_and_password() -> tuple[str, str]:
+    saved = read_settings()
+    defaults = merged_defaults()
+    hm_conf = dict(defaults.get("hm") or {})
+    hm_url = str(saved.get("hm_url") or hm_conf.get("url") or "").strip().rstrip("/")
+    hm_password = str(saved.get("hm_admin_password") or os.getenv("HM_ADMIN_PASSWORD", "")).strip()
+    if not hm_url:
+        raise HTTPException(status_code=400, detail="未配置 HM grokcli-2api URL，请先到设置页填写")
+    if not hm_password:
+        raise HTTPException(status_code=400, detail="未配置 HM 管理员密码，请先到设置页填写")
+    return hm_url, hm_password
+
+
+def _hm_request(method: str, path: str, *, json_body: Any | None = None, timeout: int = 30) -> requests.Response:
+    hm_url, hm_password = _hm_base_and_password()
+    url = f"{hm_url}{path}"
+    return requests.request(
+        method,
+        url,
+        headers=_hm_auth_headers(hm_password),
+        json=json_body,
+        timeout=timeout,
+        allow_redirects=False,
+    )
+
+
+def _hm_admin_token() -> str:
+    token_setting = str(read_settings().get("hm_admin_token") or "").strip()
+    if token_setting:
+        return token_setting
+    base_url, password = _hm_base_and_password()
+    base_url = _normalize_hm_base_url(base_url) if "_normalize_hm_base_url" in globals() else base_url.rstrip("/")
+    try:
+        response = requests.post(
+            f"{base_url}/admin/api/login",
+            json={"password": password},
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            timeout=20,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"HTTP {response.status_code}: {response.text[:200]}")
+        data = response.json()
+        token = str(data.get("token") or data.get("session") or data.get("access_token") or "").strip()
+        if not token:
+            raise RuntimeError("HM login response did not include token")
+        return token
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"HM 管理员登录失败: {exc}")
+
+
+def _hm_proxy_headers(request: Request) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    skip = {"host", "content-length", "connection", "accept-encoding", "x-admin-token", "authorization", "cookie"}
+    for key, value in request.headers.items():
+        lk = key.lower()
+        if lk in skip:
+            continue
+        headers[key] = value
+    token = _hm_admin_token()
+    headers["X-Admin-Token"] = token
+    headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _copy_response_headers(response: requests.Response) -> dict[str, str]:
+    excluded = {"content-encoding", "content-length", "transfer-encoding", "connection"}
+    return {k: v for k, v in response.headers.items() if k.lower() not in excluded}
+
+
+def _extract_hm_accounts(payload: Any) -> list[dict[str, Any]]:
+    candidates = []
+    if isinstance(payload, list):
+        candidates = payload
+    elif isinstance(payload, dict):
+        for key in ("accounts", "items", "rows", "data", "results"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                candidates = value
+                break
+            if isinstance(value, dict):
+                nested = _extract_hm_accounts(value)
+                if nested:
+                    candidates = nested
+                    break
+    out: list[dict[str, Any]] = []
+    for item in candidates:
+        if isinstance(item, dict):
+            out.append(item)
+    return out
+
+
+def _account_value(account: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in account and account.get(key) not in (None, ""):
+            return account.get(key)
+    return ""
+
+
+def _normalize_hm_account(account: dict[str, Any]) -> dict[str, Any]:
+    account_id = _account_value(account, "id", "account_id", "uid", "email", "username")
+    email = _account_value(account, "email", "mail", "username", "name")
+    status = _account_value(account, "pool_status", "status", "state", "enabled")
+    if isinstance(status, bool):
+        status = "enabled" if status else "disabled"
+    return {
+        "id": str(account_id or ""),
+        "email": str(email or account_id or ""),
+        "status": str(status or "unknown"),
+        "model_blocked": bool(_account_value(account, "model_blocked", "blocked", "is_blocked")),
+        "enabled": bool(account.get("enabled", str(status).lower() not in {"disabled", "expired", "banned"})),
+        "pool_status": str(_account_value(account, "pool_status", "status", "state") or "unknown"),
+        "last_used_at": str(_account_value(account, "last_used_at", "last_used", "updated_at") or ""),
+        "last_error": str(_account_value(account, "last_error", "error", "reason") or ""),
+        "models": _account_value(account, "models", "available_models", "model_list") or [],
+        "raw": account,
+    }
+
+
+def _hm_account_stats(accounts: list[dict[str, Any]]) -> dict[str, int]:
+    stats = {"total": len(accounts), "enabled": 0, "cooldown": 0, "expired": 0, "disabled": 0, "blocked": 0}
+    for account in accounts:
+        status = str(account.get("pool_status") or account.get("status") or "").lower()
+        if account.get("enabled") and status not in {"cooldown", "expired", "disabled", "banned"}:
+            stats["enabled"] += 1
+        if "cool" in status:
+            stats["cooldown"] += 1
+        if "expire" in status or "过期" in status:
+            stats["expired"] += 1
+        if "disable" in status or "ban" in status:
+            stats["disabled"] += 1
+        if account.get("model_blocked") or "block" in status:
+            stats["blocked"] += 1
+    return stats
+
+
+def read_settings() -> dict[str, Any]:
+    return _json_setting("system")
+
+
+def write_settings(settings: SystemSettings) -> dict[str, Any]:
+    data = settings.model_dump()
+    old = read_settings()
+    # Secret fields are write-only in the UI: blank means keep existing value.
+    for secret_key in ("temp_mail_admin_password", "temp_mail_site_password", "cpa_management_key", "hm_admin_password"):
+        if not str(data.get(secret_key) or "").strip() and old.get(secret_key):
+            data[secret_key] = old.get(secret_key)
+    _write_json_setting("system", data)
     return data
 
 
@@ -484,33 +772,43 @@ def merged_defaults() -> dict[str, Any]:
     for key in ("temp_mail_api_base", "temp_mail_admin_password", "temp_mail_domain", "temp_mail_site_password"):
         if key in saved:
             base[key] = str(saved.get(key, ""))
-    api_base = dict(base.get("api") or {})
-    if "api_endpoint" in saved:
-        api_base["endpoint"] = str(saved.get("api_endpoint", ""))
-    if "api_token" in saved:
-        api_base["token"] = str(saved.get("api_token", ""))
-    if "api_append" in saved:
-        api_base["append"] = bool(saved.get("api_append", True))
-    base["api"] = api_base
+    configured_domains = split_mail_domains(saved.get("temp_mail_domain") if "temp_mail_domain" in saved else base.get("temp_mail_domains") or base.get("temp_mail_domain"))
+    base["temp_mail_domain"] = ", ".join(configured_domains)
+    base["temp_mail_domains"] = configured_domains
+    base["api"] = {"endpoint": "", "token": "", "append": True}
+    base["cpa"] = {
+        "url": str(saved.get("cpa_url", "")),
+        "management_key_saved": bool(saved.get("cpa_management_key")),
+    }
+    base["hm"] = {
+        "url": str(saved.get("hm_url", "")),
+        "admin_password_saved": bool(saved.get("hm_admin_password")),
+        "probe_model": str(saved.get("hm_probe_model", "grok-4.5") or "grok-4.5"),
+    }
     return base
 
 
 def build_task_config(payload: TaskCreate) -> dict[str, Any]:
     defaults = merged_defaults()
-    api_defaults = dict(defaults.get("api") or {})
+
+    def value_or_default(value: str | None, key: str) -> str:
+        # Password/secret inputs are intentionally blank after page reload.
+        # Treat blank strings the same as omitted values so new tasks keep using
+        # saved settings instead of generating configs with empty passwords.
+        if value is None:
+            return str(defaults.get(key, "") or "")
+        stripped = value.strip()
+        return stripped if stripped else str(defaults.get(key, "") or "")
+
     return {
-        "run": {"count": int(payload.count)},
-        "proxy": defaults.get("proxy", "") if payload.proxy is None else payload.proxy.strip(),
-        "browser_proxy": defaults.get("browser_proxy", "") if payload.browser_proxy is None else payload.browser_proxy.strip(),
-        "temp_mail_api_base": defaults.get("temp_mail_api_base", "") if payload.temp_mail_api_base is None else payload.temp_mail_api_base.strip(),
-        "temp_mail_admin_password": defaults.get("temp_mail_admin_password", "") if payload.temp_mail_admin_password is None else payload.temp_mail_admin_password.strip(),
-        "temp_mail_domain": defaults.get("temp_mail_domain", "") if payload.temp_mail_domain is None else payload.temp_mail_domain.strip(),
-        "temp_mail_site_password": defaults.get("temp_mail_site_password", "") if payload.temp_mail_site_password is None else payload.temp_mail_site_password.strip(),
-        "api": {
-            "endpoint": api_defaults.get("endpoint", "") if payload.api_endpoint is None else payload.api_endpoint.strip(),
-            "token": api_defaults.get("token", "") if payload.api_token is None else payload.api_token.strip(),
-            "append": api_defaults.get("append", True) if payload.api_append is None else bool(payload.api_append),
-        },
+        "proxy": value_or_default(payload.proxy, "proxy"),
+        "browser_proxy": value_or_default(payload.browser_proxy, "browser_proxy"),
+        "temp_mail_api_base": value_or_default(payload.temp_mail_api_base, "temp_mail_api_base"),
+        "temp_mail_admin_password": value_or_default(payload.temp_mail_admin_password, "temp_mail_admin_password"),
+        "temp_mail_domain": value_or_default(payload.temp_mail_domain, "temp_mail_domain"),
+        "temp_mail_domains": defaults.get("temp_mail_domains", []),
+        "temp_mail_site_password": value_or_default(payload.temp_mail_site_password, "temp_mail_site_password"),
+        "api": {"endpoint": "", "token": "", "append": True},
     }
 
 
@@ -534,6 +832,12 @@ def serialize_task(row: sqlite3.Row) -> dict[str, Any]:
         "finished_at": row["finished_at"],
         "exit_code": row["exit_code"],
         "pid": row["pid"],
+        "cpa_import_status": row["cpa_import_status"] if "cpa_import_status" in row.keys() else "",
+        "cpa_imported_count": int(row["cpa_imported_count"] or 0) if "cpa_imported_count" in row.keys() else 0,
+        "cpa_import_failed_count": int(row["cpa_import_failed_count"] or 0) if "cpa_import_failed_count" in row.keys() else 0,
+        "cpa_import_last_error": row["cpa_import_last_error"] if "cpa_import_last_error" in row.keys() else "",
+        "cpa_import_at": row["cpa_import_at"] if "cpa_import_at" in row.keys() else "",
+        "hm_import_processed_count": int(row["hm_import_processed_count"] or 0) if "hm_import_processed_count" in row.keys() else 0,
     }
 
 
@@ -642,6 +946,369 @@ def copy_source_to_task_dir(task_dir: Path, task_config: dict[str, Any]) -> None
     )
 
 
+def task_sso_output_path(row: sqlite3.Row) -> Path:
+    return Path(row["task_dir"]) / "sso" / f"task_{int(row['id'])}.txt"
+
+
+def auto_import_task_sso_to_cpa(task_id: int) -> None:
+    row = task_row(task_id)
+    if row["cpa_import_status"] in {"running", "success"}:
+        return
+    output_path = task_sso_output_path(row)
+    if not output_path.exists() or output_path.stat().st_size <= 0:
+        execute_no_return(
+            """
+            UPDATE tasks
+            SET cpa_import_status = ?, cpa_import_last_error = ?, cpa_import_at = ?
+            WHERE id = ?
+            """,
+            ("skipped", "No SSO output file found for automatic CPA import.", now_iso(), task_id),
+        )
+        return
+
+    settings = read_settings()
+    cpa_url = str(settings.get("cpa_url") or "").strip()
+    management_key = str(settings.get("cpa_management_key") or "").strip()
+    if not cpa_url or not management_key:
+        execute_no_return(
+            """
+            UPDATE tasks
+            SET cpa_import_status = ?, cpa_import_last_error = ?, cpa_import_at = ?
+            WHERE id = ?
+            """,
+            ("waiting_config", "CLIProxyAPI URL or Management Key is not configured.", now_iso(), task_id),
+        )
+        return
+
+    sso_text = output_path.read_text(encoding="utf-8", errors="replace")
+    if not sso_text.strip():
+        execute_no_return(
+            """
+            UPDATE tasks
+            SET cpa_import_status = ?, cpa_import_last_error = ?, cpa_import_at = ?
+            WHERE id = ?
+            """,
+            ("skipped", "SSO output file is empty.", now_iso(), task_id),
+        )
+        return
+
+    execute_no_return(
+        """
+        UPDATE tasks
+        SET cpa_import_status = ?, cpa_import_last_error = ?, cpa_import_at = ?
+        WHERE id = ?
+        """,
+        ("running", "", now_iso(), task_id),
+    )
+    try:
+        result = import_sso_text(
+            sso_text,
+            max_workers=2,
+            backup=False,
+            dry_run=False,
+            cpa_url=cpa_url,
+            management_key=management_key,
+            remote_import=True,
+        )
+        status = "success" if result.get("ok") else "failed"
+        errors = [str(r.get("error")) for r in result.get("results", []) if isinstance(r, dict) and r.get("error")]
+        execute_no_return(
+            """
+            UPDATE tasks
+            SET cpa_import_status = ?, cpa_imported_count = ?, cpa_import_failed_count = ?,
+                cpa_import_last_error = ?, cpa_import_at = ?
+            WHERE id = ?
+            """,
+            (
+                status,
+                int(result.get("success") or 0),
+                int(result.get("failed") or 0),
+                "; ".join(errors[:3])[:1000],
+                now_iso(),
+                task_id,
+            ),
+        )
+    except Exception as exc:
+        execute_no_return(
+            """
+            UPDATE tasks
+            SET cpa_import_status = ?, cpa_import_last_error = ?, cpa_import_at = ?
+            WHERE id = ?
+            """,
+            ("failed", str(exc)[:1000], now_iso(), task_id),
+        )
+
+
+
+def _normalize_hm_base_url(url: str) -> str:
+    value = str(url or "").strip().rstrip("/")
+    if value.endswith("/admin/api"):
+        value = value[: -len("/admin/api")]
+    elif value.endswith("/admin"):
+        value = value[: -len("/admin")]
+    return value.rstrip("/")
+
+
+def _hm_json(method: str, base_url: str, path: str, *, token: str = "", payload: dict[str, Any] | None = None, timeout: int = 60) -> dict[str, Any]:
+    url = f"{base_url}/admin/api{path}"
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["X-Admin-Token"] = token
+        headers["Authorization"] = f"Bearer {token}"
+    resp = requests.request(method, url, headers=headers, json=payload, timeout=timeout)
+    if resp.status_code >= 400:
+        try:
+            detail = resp.json().get("detail") or resp.text
+        except Exception:
+            detail = resp.text
+        raise RuntimeError(f"HM API {method} {path} failed: HTTP {resp.status_code}: {str(detail)[:300]}")
+    try:
+        return resp.json()
+    except Exception:
+        return {"ok": True, "text": resp.text}
+
+
+def hm_login(base_url: str, admin_password: str) -> str:
+    data = _hm_json("POST", base_url, "/login", payload={"password": admin_password}, timeout=30)
+    token = str(data.get("token") or "").strip()
+    if not token:
+        raise RuntimeError("HM login did not return admin token")
+    return token
+
+
+def _parse_hm_sso_lines(text: str) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        # HM accepts email----password----sso lines, but pure SSO is safest here.
+        if "----" in line:
+            line = line.split("----")[-1].strip()
+        if line.lower().startswith("sso="):
+            line = line[4:].strip()
+        if not line or line in seen:
+            continue
+        seen.add(line)
+        out.append(line)
+    return out
+
+
+def hm_import_sso_and_filter(text: str, *, base_url: str, admin_password: str, probe_model: str = "grok-4.5") -> dict[str, Any]:
+    base_url = _normalize_hm_base_url(base_url)
+    if not base_url:
+        raise RuntimeError("HM URL is not configured")
+    if not admin_password:
+        raise RuntimeError("HM admin password is not configured")
+    sso_lines = _parse_hm_sso_lines(text)
+    if not sso_lines:
+        return {"ok": True, "total": 0, "imported_count": 0, "probed_count": 0, "deleted_count": 0, "message": "No SSO lines"}
+
+    token = hm_login(base_url, admin_password)
+    started = _hm_json(
+        "POST",
+        base_url,
+        "/accounts/import-sso",
+        token=token,
+        payload={"sso_cookies": sso_lines, "merge": True, "delay": 0, "max_workers": 2},
+        timeout=60,
+    )
+    job_id = str(started.get("job_id") or "").strip()
+    if not job_id:
+        raise RuntimeError("HM SSO import did not return job_id")
+
+    job: dict[str, Any] = {}
+    deadline = time.time() + max(180, 45 * len(sso_lines))
+    while time.time() < deadline:
+        job = _hm_json("GET", base_url, f"/accounts/import-sso/jobs/{job_id}", token=token, timeout=30)
+        if job.get("status") in {"done", "error"}:
+            break
+        time.sleep(2)
+    if job.get("status") not in {"done", "error"}:
+        raise RuntimeError("HM SSO import timed out")
+
+    imported = [x for x in (job.get("imported") or []) if isinstance(x, dict) and x.get("id")]
+    imported_ids = [str(x.get("id")) for x in imported if x.get("id")]
+    if not imported_ids:
+        return {
+            "ok": bool(job.get("ok")),
+            "total": len(sso_lines),
+            "job_id": job_id,
+            "imported_count": 0,
+            "probed_count": 0,
+            "deleted_count": 0,
+            "import_success": int(job.get("success") or 0),
+            "import_fail": int(job.get("fail") or 0),
+            "message": job.get("message") or "HM import completed without imported accounts",
+        }
+
+    probe = _hm_json(
+        "POST",
+        base_url,
+        "/accounts/probe-batch",
+        token=token,
+        payload={"ids": imported_ids, "model": probe_model or "grok-4.5", "auto_disable": True},
+        timeout=max(90, 20 * len(imported_ids)),
+    )
+    results = [x for x in (probe.get("results") or []) if isinstance(x, dict)]
+
+    def _is_access_denied_blocked(r: dict[str, Any]) -> bool:
+        text = json.dumps(r, ensure_ascii=False).lower()
+        pool = r.get("pool") if isinstance(r.get("pool"), dict) else {}
+        blocked_models = {str(x).lower() for x in (pool.get("blocked_model_ids") or [])}
+        return (
+            "access denied" in text
+            or (str(probe_model or "grok-4.5").lower() in blocked_models)
+            or ("屏蔽" in text and str(probe_model or "grok-4.5").lower() in text)
+        )
+
+    delete_ids = []
+    for r in results:
+        aid = str(r.get("account_id") or (r.get("pool") or {}).get("id") or "").strip()
+        if aid and _is_access_denied_blocked(r):
+            delete_ids.append(aid)
+    delete_ids = list(dict.fromkeys(delete_ids))
+    delete_result: dict[str, Any] = {"ok": True, "removed_count": 0}
+    if delete_ids:
+        delete_result = _hm_json(
+            "POST",
+            base_url,
+            "/accounts/delete-batch",
+            token=token,
+            payload={"ids": delete_ids},
+            timeout=60,
+        )
+    return {
+        "ok": True,
+        "total": len(sso_lines),
+        "job_id": job_id,
+        "imported_count": len(imported_ids),
+        "import_success": int(job.get("success") or 0),
+        "import_fail": int(job.get("fail") or 0),
+        "probed_count": len(results),
+        "deleted_count": int(delete_result.get("removed_count") or len(delete_result.get("removed") or []) or len(delete_ids)),
+        "deleted_ids": delete_ids,
+        "probe_model": probe_model or "grok-4.5",
+        "message": f"HM import/probe done: imported={len(imported_ids)}, deleted={len(delete_ids)}",
+    }
+
+
+def _task_hm_processed_count(row: sqlite3.Row) -> int:
+    if "hm_import_processed_count" not in row.keys():
+        return 0
+    try:
+        return max(0, int(row["hm_import_processed_count"] or 0))
+    except Exception:
+        return 0
+
+
+def auto_import_task_sso_to_hm(task_id: int, *, incremental: bool = False, quiet_no_new: bool = False) -> None:
+    """Import task SSO output into HM account pool.
+
+    incremental=True sends only newly appended SSO lines. This is called while
+    the task is still running so each completed registration reaches the HM
+    account pool quickly instead of waiting for the whole task to finish.
+    """
+    row = task_row(task_id)
+    output_path = task_sso_output_path(row)
+    if not output_path.exists() or output_path.stat().st_size <= 0:
+        if not quiet_no_new:
+            execute_no_return(
+                """
+                UPDATE tasks
+                SET cpa_import_status = ?, cpa_import_last_error = ?, cpa_import_at = ?
+                WHERE id = ?
+                """,
+                ("skipped", "No SSO output file found for HM import.", now_iso(), task_id),
+            )
+        return
+
+    all_sso_lines = _parse_hm_sso_lines(output_path.read_text(encoding="utf-8", errors="replace"))
+    processed_count = _task_hm_processed_count(row)
+    if incremental:
+        sso_lines = all_sso_lines[processed_count:]
+    else:
+        sso_lines = all_sso_lines[processed_count:] if processed_count < len(all_sso_lines) else []
+
+    if not sso_lines:
+        if not quiet_no_new:
+            execute_no_return(
+                """
+                UPDATE tasks
+                SET cpa_import_status = ?, cpa_import_last_error = ?, cpa_import_at = ?
+                WHERE id = ?
+                """,
+                ("hm_no_new_sso", f"No new SSO lines to import. processed={processed_count}, total={len(all_sso_lines)}", now_iso(), task_id),
+            )
+        return
+
+    settings = read_settings()
+    hm_url = str(settings.get("hm_url") or "").strip()
+    hm_admin_password = str(settings.get("hm_admin_password") or "").strip()
+    probe_model = str(settings.get("hm_probe_model") or "grok-4.5").strip() or "grok-4.5"
+    if not hm_url or not hm_admin_password:
+        execute_no_return(
+            """
+            UPDATE tasks
+            SET cpa_import_status = ?, cpa_import_last_error = ?, cpa_import_at = ?
+            WHERE id = ?
+            """,
+            ("waiting_hm_config", "HM URL or admin password is not configured.", now_iso(), task_id),
+        )
+        return
+
+    execute_no_return(
+        """
+        UPDATE tasks
+        SET cpa_import_status = ?, cpa_import_last_error = ?, cpa_import_at = ?
+        WHERE id = ?
+        """,
+        ("hm_running_incremental" if incremental else "hm_running", f"Importing {len(sso_lines)} new SSO line(s) to HM account pool...", now_iso(), task_id),
+    )
+    try:
+        result = hm_import_sso_and_filter(
+            "\n".join(sso_lines) + "\n",
+            base_url=hm_url,
+            admin_password=hm_admin_password,
+            probe_model=probe_model,
+        )
+        imported_delta = int(result.get("imported_count") or 0)
+        deleted_delta = int(result.get("deleted_count") or 0)
+        import_fail_delta = int(result.get("import_fail") or 0)
+        previous_imported = int(row["cpa_imported_count"] or 0) if "cpa_imported_count" in row.keys() else 0
+        previous_failed = int(row["cpa_import_failed_count"] or 0) if "cpa_import_failed_count" in row.keys() else 0
+        new_processed = processed_count + len(sso_lines)
+        execute_no_return(
+            """
+            UPDATE tasks
+            SET cpa_import_status = ?, cpa_imported_count = ?, cpa_import_failed_count = ?,
+                cpa_import_last_error = ?, cpa_import_at = ?, hm_import_processed_count = ?
+            WHERE id = ?
+            """,
+            (
+                "hm_imported_live" if incremental else "hm_filtered",
+                previous_imported + imported_delta,
+                previous_failed + deleted_delta + import_fail_delta,
+                str(result.get("message") or f"Imported {len(sso_lines)} new SSO line(s) to HM account pool")[:1000],
+                now_iso(),
+                new_processed,
+                task_id,
+            ),
+        )
+    except Exception as exc:
+        # Do not advance hm_import_processed_count on failure; the next loop/finalizer
+        # will retry the same new SSO lines.
+        execute_no_return(
+            """
+            UPDATE tasks
+            SET cpa_import_status = ?, cpa_import_last_error = ?, cpa_import_at = ?
+            WHERE id = ?
+            """,
+            ("hm_failed_incremental" if incremental else "hm_failed", str(exc)[:1000], now_iso(), task_id),
+        )
+
+
 class TaskSupervisor:
     def __init__(self) -> None:
         self._processes: dict[int, ManagedProcess] = {}
@@ -699,7 +1366,26 @@ class TaskSupervisor:
             (STATUS_QUEUED, slots),
         )
         for row in queued:
-            self._start_task(row)
+            try:
+                self._start_task(row)
+            except Exception as exc:
+                task_id = int(row["id"])
+                error = f"Failed to start task: {exc}"
+                console_path = Path(row["console_path"])
+                try:
+                    console_path.parent.mkdir(parents=True, exist_ok=True)
+                    with console_path.open("a", encoding="utf-8") as log_handle:
+                        log_handle.write(f"{now_iso()} | [Error] {error}\n")
+                except Exception:
+                    pass
+                execute_no_return(
+                    """
+                    UPDATE tasks
+                    SET status = ?, finished_at = ?, current_phase = ?, last_error = ?, last_log_at = ?
+                    WHERE id = ?
+                    """,
+                    (STATUS_FAILED, now_iso(), "start_failed", error[:1000], now_iso(), task_id),
+                )
 
     def _start_task(self, row: sqlite3.Row) -> None:
         task_id = int(row["id"])
@@ -760,6 +1446,10 @@ class TaskSupervisor:
                     task_id,
                 ),
             )
+            # Push new SSO lines into HM account pool as soon as they appear.
+            # This is more reliable than watching completed_count because the log line
+            # and SSO file append may not happen in the exact same supervisor tick.
+            auto_import_task_sso_to_hm(task_id, incremental=True, quiet_no_new=True)
             exit_code = managed.process.poll()
             if exit_code is None:
                 continue
@@ -792,6 +1482,8 @@ class TaskSupervisor:
                     task_id,
                 ),
             )
+            if final_status in {STATUS_COMPLETED, STATUS_PARTIAL}:
+                auto_import_task_sso_to_hm(task_id, incremental=False, quiet_no_new=True)
             finished.append(task_id)
         for task_id in finished:
             managed = self._processes.pop(task_id, None)
@@ -816,17 +1508,275 @@ app = FastAPI(title="Grok Register Console", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
 
 
-@app.get("/", response_class=HTMLResponse)
-def index(request: Request) -> HTMLResponse:
-    return TEMPLATES.TemplateResponse(
-        request,
-        "index.html",
-        {
-            "request": request,
-            "defaults": json.dumps(merged_defaults(), ensure_ascii=False),
-            "max_concurrent_tasks": MAX_CONCURRENT_TASKS,
-            "source_project": str(SOURCE_PROJECT),
-        },
+PUBLIC_PATHS = {"/login", "/admin/login", "/api/login", "/api/auth/status", "/admin/api/status", "/admin/api/session", "/admin/api/login", "/admin/api/setup", "/admin/api/logout"}
+
+
+@app.middleware("http")
+async def require_login(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/static/") or path in PUBLIC_PATHS:
+        return await call_next(request)
+    if request_has_console_session(request):
+        return await call_next(request)
+    if path.startswith("/api/"):
+        return Response('{"detail":"Login required"}', status_code=401, media_type="application/json")
+    return RedirectResponse(url="/login", status_code=303)
+
+
+def _auth_status_payload() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "setup_needed": auth_setup_required(),
+        "store": {"backend": "proxy"},
+        "accounts": {},
+        "pool": {},
+    }
+
+
+def _json_response(payload: dict[str, Any], status_code: int = 200) -> Response:
+    return Response(json.dumps(payload, ensure_ascii=False), status_code=status_code, media_type="application/json")
+
+
+async def _handle_console_login(request: Request) -> Response:
+    raw = await request.body()
+    content_type = (request.headers.get("content-type") or "").lower()
+    if "application/json" in content_type:
+        try:
+            form = json.loads(raw.decode("utf-8", errors="replace") or "{}")
+        except Exception:
+            form = {}
+    else:
+        form = {key: values[-1] for key, values in parse_qs(raw.decode("utf-8", errors="replace")).items()}
+    password = str(form.get("password") or "")
+    if auth_setup_required():
+        confirm = str(form.get("confirm_password") or form.get("confirm") or password)
+        if len(password) < 8:
+            return _json_response({"ok": False, "detail": "Password must be at least 8 characters"}, 400)
+        if password != confirm:
+            return _json_response({"ok": False, "detail": "Passwords do not match"}, 400)
+        save_console_password(password)
+    elif not verify_console_password(password):
+        return _json_response({"ok": False, "detail": "Invalid password"}, 401)
+    response = _json_response({"ok": True, "token": make_session_cookie(), "message": "登录成功"})
+    set_console_session_cookies(response)
+    return response
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page(request: Request) -> Response:
+    if request_has_console_session(request):
+        return RedirectResponse(url="/admin", status_code=303)
+    return _hm_admin_static_page("login")
+
+
+@app.get("/admin/login", response_class=HTMLResponse)
+def hm_login_page(request: Request) -> Response:
+    return login_page(request)
+
+
+@app.post("/api/login")
+async def api_login(request: Request) -> Response:
+    return await _handle_console_login(request)
+
+
+@app.get("/admin/api/status")
+def hm_login_status() -> dict[str, Any]:
+    return _auth_status_payload()
+
+
+@app.get("/admin/api/session")
+def hm_login_session(request: Request) -> dict[str, Any]:
+    authed = request_has_console_session(request)
+    if not authed:
+        raise HTTPException(status_code=401, detail="Admin authentication required")
+    return {"ok": True, "authenticated": True, "setup_needed": auth_setup_required()}
+
+
+@app.post("/admin/api/login")
+async def hm_login_api(request: Request) -> Response:
+    return await _handle_console_login(request)
+
+
+@app.post("/admin/api/setup")
+async def hm_setup_api(request: Request) -> Response:
+    return await _handle_console_login(request)
+
+
+@app.post("/admin/api/logout")
+def hm_logout_api() -> Response:
+    response = _json_response({"ok": True})
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    response.delete_cookie(HM_ADMIN_COOKIE, path="/")
+    return response
+
+
+@app.get("/logout")
+def logout() -> RedirectResponse:
+    response = RedirectResponse(url="/login", status_code=303)
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    response.delete_cookie(HM_ADMIN_COOKIE, path="/")
+    return response
+
+
+@app.get("/settings")
+def settings_page_legacy_redirect() -> RedirectResponse:
+    return RedirectResponse(url="/admin/settings", status_code=303)
+
+
+@app.get("/")
+def index_legacy_redirect() -> RedirectResponse:
+    return RedirectResponse(url="/admin", status_code=303)
+
+
+@app.get("/accounts")
+def accounts_redirect() -> RedirectResponse:
+    return RedirectResponse(url="/admin/accounts", status_code=303)
+
+
+@app.get("/api/hm/accounts")
+def api_hm_accounts(request: Request) -> dict[str, Any]:
+    _ensure_console_auth(request)
+    paths = [
+        "/admin/api/accounts",
+        "/admin/api/account-pool",
+        "/admin/api/pool/accounts",
+        "/admin/api/accounts/list",
+    ]
+    attempts: list[dict[str, Any]] = []
+    for path in paths:
+        try:
+            response = _hm_request("GET", path, timeout=20)
+            attempts.append({"path": path, "status": response.status_code, "body": response.text[:200]})
+            if response.status_code >= 400:
+                continue
+            payload = response.json()
+            accounts = [_normalize_hm_account(item) for item in _extract_hm_accounts(payload)]
+            if accounts or isinstance(payload, (list, dict)):
+                return {
+                    "ok": True,
+                    "source_path": path,
+                    "stats": _hm_account_stats(accounts),
+                    "accounts": accounts,
+                    "raw_keys": list(payload.keys()) if isinstance(payload, dict) else [],
+                }
+        except Exception as exc:
+            attempts.append({"path": path, "error": str(exc)})
+    raise HTTPException(status_code=502, detail={"message": "无法读取 HM 账号接口", "attempts": attempts})
+
+
+@app.post("/api/hm/accounts/action")
+def api_hm_accounts_action(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
+    _ensure_console_auth(request)
+    action = str(payload.get("action") or "").strip()
+    account_ids = payload.get("account_ids") or []
+    all_accounts = bool(payload.get("all"))
+    body = {"account_ids": account_ids, "all": all_accounts}
+    candidates: dict[str, list[tuple[str, str]]] = {
+        "probe": [("POST", "/admin/api/accounts/probe"), ("POST", "/admin/api/accounts/test"), ("POST", "/admin/api/accounts/check")],
+        "refresh": [("POST", "/admin/api/accounts/refresh"), ("POST", "/admin/api/accounts/renew")],
+        "enable": [("POST", "/admin/api/accounts/enable"), ("POST", "/admin/api/accounts/bulk-enable")],
+        "disable": [("POST", "/admin/api/accounts/disable"), ("POST", "/admin/api/accounts/bulk-disable")],
+        "delete": [("POST", "/admin/api/accounts/delete"), ("DELETE", "/admin/api/accounts")],
+    }
+    if action not in candidates:
+        raise HTTPException(status_code=400, detail="Unknown action")
+    attempts: list[dict[str, Any]] = []
+    for method, path in candidates[action]:
+        try:
+            response = _hm_request(method, path, json_body=body, timeout=60)
+            attempts.append({"method": method, "path": path, "status": response.status_code, "body": response.text[:300]})
+            if response.status_code < 400:
+                try:
+                    data = response.json()
+                except Exception:
+                    data = {"text": response.text[:500]}
+                return {"ok": True, "action": action, "path": path, "result": data}
+        except Exception as exc:
+            attempts.append({"method": method, "path": path, "error": str(exc)})
+    raise HTTPException(status_code=502, detail={"message": "HM 操作接口调用失败", "attempts": attempts})
+
+
+
+def _hm_admin_static_page(page_name: str) -> Response:
+    allowed = {
+        "index": "index.html",
+        "accounts": "accounts.html",
+        "keys": "keys.html",
+        "usage": "usage.html",
+        "logs": "logs.html",
+        "models": "models.html",
+        "settings": "settings.html",
+        "guide": "guide.html",
+        "login": "login.html",
+    }
+    filename = allowed.get((page_name or "index").strip().lower())
+    if not filename:
+        raise HTTPException(status_code=404, detail="Not found")
+    path = APP_DIR / "static" / "admin" / filename
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Not found")
+    return Response(path.read_text(encoding="utf-8"), media_type="text/html; charset=utf-8")
+
+
+@app.get("/admin/register-tasks", response_class=HTMLResponse)
+def register_tasks_page(request: Request) -> Response:
+    return Response(
+        (APP_DIR / "static" / "admin" / "register-tasks.html").read_text(encoding="utf-8"),
+        media_type="text/html; charset=utf-8",
+    )
+
+
+@app.get("/admin/accounts", response_class=HTMLResponse)
+def hm_admin_accounts_page(request: Request) -> Response:
+    return _hm_admin_static_page("accounts")
+
+
+@app.get("/admin", response_class=HTMLResponse)
+def hm_admin_root() -> Response:
+    return _hm_admin_static_page("index")
+
+
+@app.get("/admin/{page_name}", response_class=HTMLResponse)
+def hm_admin_alias_page(page_name: str, request: Request) -> Response:
+    return _hm_admin_static_page(page_name)
+
+
+@app.api_route("/admin/api/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+async def hm_admin_api_proxy(path: str, request: Request) -> Response:
+    if path in {"login", "setup", "logout", "session", "status"}:
+        raise HTTPException(status_code=404, detail="Local auth route not found")
+    _ensure_console_auth(request)
+    base_url, _ = _hm_base_and_password()
+    base_url = _normalize_hm_base_url(base_url) if "_normalize_hm_base_url" in globals() else base_url.rstrip("/")
+    url = f"{base_url}/admin/api/{path}"
+    if request.url.query:
+        url += f"?{request.url.query}"
+    body = await request.body()
+    try:
+        upstream = requests.request(
+            request.method,
+            url,
+            headers=_hm_proxy_headers(request),
+            data=body if body else None,
+            timeout=300,
+            allow_redirects=False,
+            stream=True,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"HM API proxy failed: {exc}")
+    content_type = upstream.headers.get("content-type", "")
+    if "text/event-stream" in content_type.lower():
+        return StreamingResponse(
+            upstream.iter_content(chunk_size=8192),
+            status_code=upstream.status_code,
+            media_type=content_type,
+            headers=_copy_response_headers(upstream),
+        )
+    return Response(
+        upstream.content,
+        status_code=upstream.status_code,
+        headers=_copy_response_headers(upstream),
+        media_type=content_type or None,
     )
 
 
@@ -848,13 +1798,71 @@ def api_health() -> dict[str, Any]:
 
 @app.get("/api/settings")
 def get_settings() -> dict[str, Any]:
-    return {"settings": read_settings(), "defaults": merged_defaults()}
+    settings = read_settings()
+    if settings.get("cpa_management_key"):
+        settings["cpa_management_key"] = ""
+        settings["cpa_management_key_saved"] = True
+    return {"settings": settings, "defaults": merged_defaults()}
 
 
 @app.post("/api/settings")
 def save_settings(payload: SystemSettings) -> dict[str, Any]:
     saved = write_settings(payload)
+    if saved.get("cpa_management_key"):
+        saved["cpa_management_key"] = ""
+        saved["cpa_management_key_saved"] = True
     return {"settings": saved, "defaults": merged_defaults()}
+
+
+@app.post("/api/cpa/import-sso")
+def import_sso_to_cpa(payload: CpaSsoImportRequest) -> dict[str, Any]:
+    settings = read_settings()
+    target_dir = Path(payload.auth_dir).expanduser() if payload.auth_dir else CPA_AUTH_DIR
+    cpa_url = (payload.cpa_url or settings.get("cpa_url") or "").strip()
+    management_key = (payload.management_key or settings.get("cpa_management_key") or "").strip()
+    remote_import = bool(payload.remote_import) or bool(cpa_url)
+    if not payload.dry_run and not remote_import:
+        # Keep the failure explicit. In the default deployment this path only
+        # exists if the CLIProxyAPI auth directory is mounted into the console
+        # container/host. Use dry_run to validate conversion without writing.
+        parent = target_dir.parent
+        if not parent.exists():
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"CLIProxyAPI auth parent does not exist: {parent}. "
+                    "Mount the auth directory into the console container, configure CLIProxyAPI URL + Management Key, "
+                    "or run apps/console/cpa_sso_importer.py on the CLIProxyAPI host."
+                ),
+            )
+        if target_dir.exists() and not os.access(target_dir, os.W_OK):
+            raise HTTPException(status_code=403, detail=f"Auth dir is not writable: {target_dir}")
+    if remote_import and not management_key:
+        raise HTTPException(status_code=400, detail="Management Key is required for remote CLIProxyAPI import")
+    try:
+        result = import_sso_text(
+            payload.sso_text,
+            auth_dir=target_dir,
+            max_workers=payload.workers,
+            backup=payload.backup,
+            dry_run=payload.dry_run,
+            cpa_url=cpa_url,
+            management_key=management_key,
+            remote_import=remote_import,
+        )
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/tasks/{task_id}/import-cpa")
+def import_task_sso_to_cpa(task_id: int) -> dict[str, Any]:
+    # Backward-compatible endpoint name: now imports to HM and filters dead accounts.
+    auto_import_task_sso_to_hm(task_id)
+    row = task_row(task_id)
+    return {"task": serialize_task(row)}
 
 
 @app.get("/api/tasks")
@@ -879,7 +1887,7 @@ def create_task(payload: TaskCreate) -> dict[str, Any]:
         """,
         (
             payload.name.strip(),
-            STATUS_QUEUED,
+            STATUS_CREATING,
             payload.count,
             payload.notes.strip(),
             json.dumps(task_config, ensure_ascii=False),
@@ -892,8 +1900,8 @@ def create_task(payload: TaskCreate) -> dict[str, Any]:
     console_path = task_dir / "console.log"
     task_dir.mkdir(parents=True, exist_ok=True)
     execute_no_return(
-        "UPDATE tasks SET task_dir = ?, console_path = ? WHERE id = ?",
-        (str(task_dir), str(console_path), task_id),
+        "UPDATE tasks SET status = ?, task_dir = ?, console_path = ? WHERE id = ?",
+        (STATUS_QUEUED, str(task_dir), str(console_path), task_id),
     )
     return {"task": serialize_task(task_row(task_id))}
 

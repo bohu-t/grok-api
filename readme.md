@@ -56,7 +56,7 @@ docker compose up -d --build
 
 - `temp_mail_api_base`: `https://api.duckmail.sbs`
 - `temp_mail_admin_password`: 可留空；如果你要用 DuckMail 私有域名，再填 API Key
-- `temp_mail_domain`: 可留空；留空时执行器会自动挑一个 DuckMail 公开可用域名
+- `temp_mail_domain`: 可留空；留空时执行器会自动挑一个 DuckMail 公开可用域名；也支持 `a.com,b.com` 多域名随机选择
 
 默认情况下：
 
@@ -116,6 +116,7 @@ python DrissionPage_example.py --count 1
   "temp_mail_api_base": "https://mail-api.example.com",
   "temp_mail_admin_password": "<your_admin_password>",
   "temp_mail_domain": "mail.example.com",
+  "temp_mail_domains": ["mail.example.com", "mail2.example.com"],
   "temp_mail_site_password": "",
   "proxy": "",
   "browser_proxy": "",

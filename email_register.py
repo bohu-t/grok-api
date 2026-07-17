@@ -44,6 +44,11 @@ TEMP_MAIL_ADMIN_PASSWORD = str(
     or ""
 )
 TEMP_MAIL_DOMAIN = str(_conf.get("temp_mail_domain") or _conf.get("duckmail_domain") or "")
+TEMP_MAIL_DOMAINS_RAW = (
+    _conf.get("temp_mail_domains")
+    or _conf.get("duckmail_domains")
+    or ""
+)
 TEMP_MAIL_SITE_PASSWORD = str(_conf.get("temp_mail_site_password", ""))
 PROXY = str(_conf.get("proxy", ""))
 TEMP_MAIL_PROVIDER = str(_conf.get("temp_mail_provider") or "").strip().lower()
@@ -152,6 +157,50 @@ def _generate_mail_password(length: int = 18) -> str:
     return "".join(random.choice(chars) for _ in range(length))
 
 
+def _split_domain_text(value: str) -> List[str]:
+    return [part.strip().lstrip("@") for part in re.split(r"[,;\s]+", value) if part.strip().lstrip("@")]
+
+
+def _normalize_domain_list(value: Any) -> List[str]:
+    domains: List[str] = []
+    if isinstance(value, str):
+        domains.extend(_split_domain_text(value))
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            if isinstance(item, str):
+                domains.extend(_split_domain_text(item))
+            elif item is not None:
+                domains.extend(_split_domain_text(str(item)))
+    elif value is not None:
+        domains.extend(_split_domain_text(str(value)))
+
+    normalized: List[str] = []
+    seen = set()
+    for domain in domains:
+        key = domain.lower()
+        if key and key not in seen:
+            normalized.append(domain)
+            seen.add(key)
+    return normalized
+
+
+def _configured_mail_domains() -> List[str]:
+    domains = _normalize_domain_list(TEMP_MAIL_DOMAINS_RAW)
+    seen = {item.lower() for item in domains}
+    for domain in _normalize_domain_list(TEMP_MAIL_DOMAIN):
+        key = domain.lower()
+        if key not in seen:
+            domains.append(domain)
+            seen.add(key)
+    return domains
+
+
+def _choose_mail_domain(domains: List[str]) -> str:
+    if not domains:
+        return ""
+    return random.choice(domains)
+
+
 def _build_duckmail_headers(token: str = "") -> Dict[str, str]:
     headers: Dict[str, str] = {}
     if token:
@@ -176,8 +225,9 @@ def _extract_duckmail_domain_name(item: Dict[str, Any]) -> str:
 
 
 def _resolve_duckmail_domain(session, use_cffi, api_base: str) -> str:
-    if TEMP_MAIL_DOMAIN:
-        return TEMP_MAIL_DOMAIN
+    configured_domains = _configured_mail_domains()
+    if configured_domains:
+        return _choose_mail_domain(configured_domains)
 
     headers = _build_duckmail_headers(TEMP_MAIL_ADMIN_PASSWORD)
     res = _do_request(
@@ -217,7 +267,7 @@ def _resolve_duckmail_domain(session, use_cffi, api_base: str) -> str:
 
     for candidates in (public_verified, verified, fallback):
         if candidates:
-            return candidates[0]
+            return _choose_mail_domain(candidates)
     raise Exception("DuckMail 域名列表里没有可用域名，请在配置里显式填写 temp_mail_domain")
 
 
@@ -292,10 +342,12 @@ def create_temp_email() -> Tuple[str, str, str]:
 
     if not TEMP_MAIL_ADMIN_PASSWORD:
         raise Exception("temp_mail_admin_password 未设置，无法创建临时邮箱")
-    if not TEMP_MAIL_DOMAIN:
-        raise Exception("temp_mail_domain 未设置，无法创建临时邮箱")
+    configured_domains = _configured_mail_domains()
+    if not configured_domains:
+        raise Exception("temp_mail_domain/temp_mail_domains 未设置，无法创建临时邮箱")
 
     api_base = TEMP_MAIL_API_BASE.rstrip("/")
+    domain = _choose_mail_domain(configured_domains)
     email_local = _generate_local_part(random.randint(8, 12))
     session, use_cffi = _create_session()
     headers = _build_headers({"x-admin-auth": TEMP_MAIL_ADMIN_PASSWORD})
@@ -308,7 +360,7 @@ def create_temp_email() -> Tuple[str, str, str]:
             f"{api_base}/admin/new_address",
             json={
                 "name": email_local,
-                "domain": TEMP_MAIL_DOMAIN,
+                "domain": domain,
                 "enablePrefix": False,
             },
             headers=headers,

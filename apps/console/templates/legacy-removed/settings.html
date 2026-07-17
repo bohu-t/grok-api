@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>设置 · Grok Register Console</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <div id="app" class="shell">
+    <header class="topbar topbar-compact">
+      <div class="brand">
+        <div class="brand-kicker">Settings</div>
+        <h1>系统设置</h1>
+        <p>代理、邮箱、CPA 导入配置统一放在这里；任务页不再展示配置类字段。</p>
+      </div>
+      <nav class="nav-actions">
+        <a class="button button-secondary" href="/">任务</a>
+        <a class="button button-secondary" href="/admin/accounts">账号</a>
+        <a class="button button-secondary" href="/logout">退出</a>
+      </nav>
+    </header>
+
+    <main class="main settings-page">
+      <section class="panel panel-settings">
+        <div class="panel-head">
+          <div>
+            <div class="eyebrow">Configuration</div>
+            <h2>默认配置</h2>
+            <p class="panel-desc">Token 上传接口 / API Token 已移除。注册完成后会先导入 HM，探测 grok-4.5，删除 Access denied/屏蔽账号。</p>
+          </div>
+        </div>
+        <form id="settingsForm" class="task-form settings-form">
+          <label>
+            <span>浏览器代理</span>
+            <small>浏览器访问 x.ai 时走的代理。</small>
+            <input name="browser_proxy" placeholder="例如 socks5://127.0.0.1:1081">
+          </label>
+          <label>
+            <span>请求代理</span>
+            <small>邮箱 API 等普通 HTTP 请求走的代理。</small>
+            <input name="proxy" placeholder="例如 socks5://127.0.0.1:1081">
+          </label>
+          <label>
+            <span>邮箱 API Base</span>
+            <small>临时邮箱服务接口地址。</small>
+            <input name="temp_mail_api_base" placeholder="https://api.duckmail.sbs">
+          </label>
+          <label>
+            <span>邮箱域名</span>
+            <small>支持单个域名，也支持多个域名（逗号、空格或换行分隔）；每次创建邮箱随机选择一个。</small>
+            <input name="temp_mail_domain" placeholder="a.example.com, b.example.com">
+          </label>
+          <label>
+            <span>邮箱管理口令 / DuckMail API Key</span>
+            <small>自定义 Temp Mail 口令或 DuckMail API Key。</small>
+            <input name="temp_mail_admin_password" type="password" autocomplete="off" placeholder="已保存时可重新填写覆盖">
+          </label>
+          <label>
+            <span>站点密码</span>
+            <small>邮箱 API 额外站点鉴权。</small>
+            <input name="temp_mail_site_password" type="password" autocomplete="off" placeholder="optional">
+          </label>
+          <label>
+            <span>HM grokcli-2api URL</span>
+            <small>用于导入 SSO 后探测账号；填 HM 管理台根地址。</small>
+            <input name="hm_url" placeholder="http://34.1.10.13:3000">
+          </label>
+          <label>
+            <span>HM 管理员密码</span>
+            <small>用于调用 HM 账号导入/探测/删除 API；已保存时留空不改。</small>
+            <input name="hm_admin_password" type="password" placeholder="已保存，留空不改" autocomplete="off">
+          </label>
+          <label>
+            <span>HM 探测模型</span>
+            <small>默认 grok-4.5；返回 Access denied / 屏蔽该模型的账号会被删除。</small>
+            <input name="hm_probe_model" placeholder="grok-4.5">
+          </label>
+          <label>
+            <span>CLIProxyAPI URL（备用）</span>
+            <small>保留旧手动 SSO→CPA 工具使用；自动链路现在先走 HM 筛号。</small>
+            <input name="cpa_url" placeholder="http://frp4.ccszxc.xin:54234">
+          </label>
+          <label>
+            <span>Management Key（备用）</span>
+            <small>手动 SSO→CPA 工具使用；已保存时留空不改。</small>
+            <input name="cpa_management_key" type="password" placeholder="已保存，留空不改" autocomplete="off">
+          </label>
+          <div class="form-actions full">
+            <button class="button" type="submit">保存设置</button>
+            <div id="settingsMessage" class="form-message"></div>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel panel-health">
+        <div class="panel-head">
+          <div>
+            <div class="eyebrow">Health Check</div>
+            <h2>环境健康检查</h2>
+            <p class="panel-desc">检查代理、临时邮箱、x.ai 访问和 CPA 配置状态。</p>
+          </div>
+          <button id="healthRefreshBtn" class="button button-secondary" type="button">重新检测</button>
+        </div>
+        <div id="healthMeta" class="health-meta">等待检测</div>
+        <div id="healthGrid" class="health-grid"></div>
+      </section>
+
+      <section class="panel panel-cpa-import">
+        <div class="panel-head">
+          <div>
+            <div class="eyebrow">Manual Import</div>
+            <h2>手动 SSO 导入 CPA</h2>
+            <p class="panel-desc">备用入口。正常情况下，注册任务完成后会自动导入 HM 并筛号；这里保留手动 SSO→CPA 工具。</p>
+          </div>
+        </div>
+        <form id="cpaImportForm" class="task-form">
+          <label class="full">
+            <span>SSO 列表</span>
+            <small>一行一个；支持 <code>sso=...</code>、纯 JWT、或 <code>邮箱----密码----sso</code>。页面不会回显原文。</small>
+            <textarea name="sso_text" rows="6" placeholder="sso=eyJ..." autocomplete="off" spellcheck="false"></textarea>
+          </label>
+          <label>
+            <span>并发转换数</span>
+            <input name="workers" type="number" min="1" max="6" value="2">
+          </label>
+          <label class="checkbox-row">
+            <input name="dry_run" type="checkbox">
+            <span>只转换测试，不上传</span>
+          </label>
+          <div class="form-actions full">
+            <button class="button" type="submit">导入 CLIProxyAPI</button>
+            <div id="cpaImportMessage" class="form-message"></div>
+          </div>
+        </form>
+        <pre id="cpaImportOutput" class="console-output cpa-output">等待导入</pre>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    window.__DEFAULTS__ = {{ defaults|safe }};
+  </script>
+  <script src="/static/settings.js"></script>
+</body>
+</html>
