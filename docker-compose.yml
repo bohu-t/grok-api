@@ -1,8 +1,23 @@
 services:
+  warp:
+    image: caomingjun/warp:latest
+    restart: unless-stopped
+    environment:
+      WARP_SLEEP: "2"
+    ports:
+      - "${WARP_HOST:-127.0.0.1}:${WARP_HOST_PORT:-1081}:1080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--socks5", "127.0.0.1:1080", "https://www.cloudflare.com/cdn-cgi/trace"]
+      interval: 30s
+      timeout: 15s
+      retries: 10
+      start_period: 30s
+
   flaresolverr:
     image: ghcr.io/flaresolverr/flaresolverr:latest
     restart: unless-stopped
     shm_size: 1gb
+
   grok2api:
     build:
       context: ./vendor/grok2api
@@ -15,7 +30,7 @@ services:
       SERVER_HOST: 0.0.0.0
       SERVER_PORT: 8000
       SERVER_WORKERS: 1
-      GROK2API_APP_KEY: ${GROK2API_APP_KEY:-change-this-admin-password}
+      GROK2API_APP_KEY: ${GROK2API_APP_KEY:-changeme-app-key}
       GROK2API_API_KEY: ${GROK2API_API_KEY:-}
       GROK2API_PROXY_MODE: ${GROK2API_PROXY_MODE:-single_proxy}
       GROK2API_BASE_PROXY_URL: ${GROK2API_BASE_PROXY_URL:-socks5://warp:1080}
@@ -31,7 +46,7 @@ services:
         if [ ! -s /app/data/config.toml ]; then
         cat >/app/data/config.toml <<EOF
         [app]
-        app_key = "${GROK2API_APP_KEY:-change-this-admin-password}"
+        app_key = "${GROK2API_APP_KEY:-changeme-app-key}"
         api_key = "${GROK2API_API_KEY:-}"
 
         [features]
@@ -60,7 +75,10 @@ services:
       - ./runtime/grok2api/logs:/app/logs
     restart: unless-stopped
     depends_on:
-      - flaresolverr
+      warp:
+        condition: service_healthy
+      flaresolverr:
+        condition: service_started
 
   console:
     build:
@@ -78,7 +96,7 @@ services:
       GROK_REGISTER_DEFAULT_PROXY: ${GROK_REGISTER_DEFAULT_PROXY:-socks5://warp:1080}
       GROK_REGISTER_DEFAULT_BROWSER_PROXY: ${GROK_REGISTER_DEFAULT_BROWSER_PROXY:-socks5://warp:1080}
       GROK_REGISTER_DEFAULT_API_ENDPOINT: ${GROK_REGISTER_DEFAULT_API_ENDPOINT:-http://grok2api:8000/admin/api/tokens/add}
-      GROK_REGISTER_DEFAULT_API_TOKEN: ${GROK_REGISTER_DEFAULT_API_TOKEN:-change-this-admin-password}
+      GROK_REGISTER_DEFAULT_API_TOKEN: ${GROK_REGISTER_DEFAULT_API_TOKEN:-}
       GROK_REGISTER_DEFAULT_API_APPEND: ${GROK_REGISTER_DEFAULT_API_APPEND:-true}
     ports:
       - "${GROK_STACK_CONSOLE_PORT:-18600}:18600"
@@ -86,4 +104,5 @@ services:
       - .:/workspace
     restart: unless-stopped
     depends_on:
-      - grok2api
+      grok2api:
+        condition: service_started
