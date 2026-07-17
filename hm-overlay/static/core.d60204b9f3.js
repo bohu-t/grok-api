@@ -4358,6 +4358,7 @@ function bindSoftNav() {
     if (href.startsWith("/admin/login") || href.startsWith("/admin/api")) return;
     // Registration tasks is an independent page with its own bootstrap script.
     // Never intercept it with HM soft navigation; let the browser perform a normal page load.
+    if ((href.split("?")[0] || "") === "/admin/accounts#protocol-registration") return;
     if ((href.split("?")[0] || "").replace(/\/$/, "") === "/admin/register-tasks") return;
     const page = pageFromPath((href.split("?")[0] || "").replace(/\/$/, ""));
     if (!(page in PAGE_HREF) && page !== "overview") return;
