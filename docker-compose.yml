@@ -1,12 +1,42 @@
 services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    env_file:
+      - ./hm.runtime.env
+    environment:
+      TZ: Asia/Shanghai
+      PGTZ: Asia/Shanghai
+      POSTGRES_USER: grok2api
+      POSTGRES_DB: grok2api
+    volumes:
+      - grok2api_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U grok2api -d grok2api"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   console:
     build:
       context: .
       dockerfile: apps/worker-runtime/Dockerfile
     image: grok2apiwarp-auto-console:latest
     container_name: grok2apiwarp-auto-console-1
-    working_dir: /workspace
-    command: python /workspace/apps/console/app.py
+    env_file:
+      - ./hm.runtime.env
     environment:
       GROK_REGISTER_SOURCE_DIR: /workspace
       GROK_REGISTER_PYTHON: /usr/local/bin/python
@@ -14,21 +44,32 @@ services:
       GROK_REGISTER_CONSOLE_PORT: ${GROK_STACK_CONSOLE_PORT:-18600}
       GROK_REGISTER_CONSOLE_MAX_CONCURRENT_TASKS: 1
       GROK_REGISTER_DEFAULT_RUN_COUNT: ${GROK_REGISTER_DEFAULT_RUN_COUNT:-50}
-      GROK_REGISTER_DEFAULT_PROXY: ${GROK_REGISTER_DEFAULT_PROXY:-socks5://127.0.0.1:1081}
-      GROK_REGISTER_DEFAULT_BROWSER_PROXY: ${GROK_REGISTER_DEFAULT_BROWSER_PROXY:-socks5://127.0.0.1:1081}
-      HM_ADMIN_PASSWORD: ${HM_ADMIN_PASSWORD:-}
+      GROK_REGISTER_DEFAULT_PROXY: socks5://127.0.0.1:1081
+      GROK_REGISTER_DEFAULT_BROWSER_PROXY: socks5://127.0.0.1:1081
+      GROK2API_HOST: 127.0.0.1
+      GROK2API_PORT: 3000
+      REDIS_URL: redis://redis:6379/0
     ports:
       - "${GROK_STACK_CONSOLE_PORT:-18600}:18600"
     volumes:
       - .:/workspace
+      - /opt/grokcli-2api/data:/app/data
     restart: unless-stopped
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
     networks:
       - default
-      - grokcli
+      - warp_proxy
+
+volumes:
+  grok2api_pg:
+    external: true
+    name: grokcli-2api_grok2api_pg
 
 networks:
-  grokcli:
+  warp_proxy:
     external: true
-    name: grokcli-2api_default
+    name: warp-proxy_default

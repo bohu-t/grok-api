@@ -19,3 +19,4 @@ apps/console/*.bak-*
 backups/
 *.bak-*
 docker-compose.yml.bak-*
+hm.runtime.env
