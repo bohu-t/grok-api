@@ -145,7 +145,6 @@ def reconcile_credentials_by_sso_hash():
 def reconcile_account_emails_from_credentials():
   try:
     from grok2api.pool import accounts
-    from grok2api.pool.auth_store import write_auth_map
     data=accounts.read_auth_map()
   except Exception:
     return 0
@@ -161,7 +160,7 @@ def reconcile_account_emails_from_credentials():
       entry.setdefault('name', email)
       changed+=1
   if changed:
-    try: write_auth_map(data)
+    try: accounts.write_auth_map(data)
     except Exception: return 0
   return changed
 def _imported_account_ids(final:dict[str,Any]|None):
@@ -264,9 +263,12 @@ def import_sso(r):
     failed=int((final or {}).get('fail') or (final or {}).get('failed') or 0)
     status=str((final or {}).get('status') or 'unknown')
     msg=(final or {}).get('message') or (final or {}).get('error') or status
-    linked=_bind_imported_accounts(int(r['id']), final) + reconcile_credentials_by_sso_hash() + reconcile_account_emails_from_credentials() + reconcile_account_emails_from_credentials()
-    processed=len(new) if status in {'done','completed'} or imported or failed else 0
-    update('UPDATE tasks SET hm_processed_count=hm_processed_count+?,hm_imported_count=hm_imported_count+?,hm_import_status=? WHERE id=?',processed,imported,(f"{status}: imported={imported} failed={failed} linked_credentials={linked} {msg}")[:1000],r['id'])
+    linked=_bind_imported_accounts(int(r['id']), final) + reconcile_credentials_by_sso_hash() + reconcile_account_emails_from_credentials()
+    probe_result=_probe_delete_bad_imports(final)
+    deleted_bad=int(probe_result.get('deleted') or 0)
+    imported=max(0, imported-deleted_bad)
+    processed=len(new) if status in {'done','completed'} or imported or failed or deleted_bad else 0
+    update('UPDATE tasks SET hm_processed_count=hm_processed_count+?,hm_imported_count=hm_imported_count+?,hm_import_status=? WHERE id=?',processed,imported,(f"{status}: imported={imported} failed={failed} deleted_bad={deleted_bad} linked_credentials={linked} {msg}")[:1000],r['id'])
   except Exception as e:update('UPDATE tasks SET hm_import_status=? WHERE id=?',('error: '+str(e))[:1000],r['id'])
 def start(r):
   dst=Path(r['task_dir']);cfg=json.loads(r['config_json']);source_copy(dst,cfg)
