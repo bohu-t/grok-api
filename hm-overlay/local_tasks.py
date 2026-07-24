@@ -8,6 +8,7 @@ import requests
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from grok2api.admin.admin_routes import require_admin
+from grok2api.admin.settings_store import create_session_token
 
 router = APIRouter(prefix="/admin/api/local-tasks", tags=["local-tasks"])
 DATA = Path("/app/data/local-tasks")
@@ -91,10 +92,31 @@ def import_sso(r):
   if not new:return
   try:
     base='http://127.0.0.1:'+os.getenv('GROK2API_PORT','3000')
-    login=requests.post(base+'/admin/api/login',json={'password':os.environ.get('GROK2API_ADMIN_PASSWORD','')},timeout=15).json()
-    token=login.get('token',''); h={'X-Admin-Token':token}
-    j=requests.post(base+'/admin/api/accounts/import-sso',headers=h,json={'sso_cookies':new,'merge':True,'delay':0,'max_workers':2},timeout=30).json()
-    update('UPDATE tasks SET hm_processed_count=?,hm_imported_count=hm_imported_count+?,hm_import_status=? WHERE id=?',done+len(new),int(j.get('success') or 0),'submitted',r['id'])
+    token=create_session_token(); h={'X-Admin-Token':token}
+    resp=requests.post(base+'/admin/api/accounts/import-sso',headers=h,json={'sso_cookies':new,'merge':True,'delay':0,'max_workers':2},timeout=30)
+    if resp.status_code>=400:
+      raise RuntimeError(f"import-sso HTTP {resp.status_code}: {resp.text[:500]}")
+    j=resp.json(); job_id=j.get('job_id')
+    if not job_id:
+      imported=int(j.get('success') or j.get('imported') or 0)
+      update('UPDATE tasks SET hm_processed_count=?,hm_imported_count=hm_imported_count+?,hm_import_status=? WHERE id=?',done+len(new),imported,'done' if imported else 'submitted_no_job',r['id'])
+      return
+    final=None
+    for _ in range(90):
+      time.sleep(2)
+      pr=requests.get(base+f'/admin/api/accounts/import-sso/jobs/{job_id}',headers=h,timeout=15)
+      if pr.status_code>=400:
+        raise RuntimeError(f"import-sso job HTTP {pr.status_code}: {pr.text[:500]}")
+      final=pr.json()
+      status=str(final.get('status') or '').lower()
+      if status in {'done','error','failed','completed'} or final.get('finished_at'):
+        break
+    imported=int((final or {}).get('success') or (final or {}).get('imported_count') or (final or {}).get('imported') or 0)
+    failed=int((final or {}).get('fail') or (final or {}).get('failed') or 0)
+    status=str((final or {}).get('status') or 'unknown')
+    msg=(final or {}).get('message') or (final or {}).get('error') or status
+    processed=len(new) if status in {'done','completed'} or imported or failed else 0
+    update('UPDATE tasks SET hm_processed_count=hm_processed_count+?,hm_imported_count=hm_imported_count+?,hm_import_status=? WHERE id=?',processed,imported,(f"{status}: imported={imported} failed={failed} {msg}")[:1000],r['id'])
   except Exception as e:update('UPDATE tasks SET hm_import_status=? WHERE id=?',('error: '+str(e))[:1000],r['id'])
 def start(r):
   dst=Path(r['task_dir']);cfg=json.loads(r['config_json']);source_copy(dst,cfg)
