@@ -121,7 +121,29 @@ def _bind_imported_accounts(task_id:int, final:dict[str,Any]|None):
       changed+=cur.rowcount
     c.commit()
   return changed
+def reconcile_credentials_by_sso_hash():
+  try:
+    from grok2api.pool import accounts
+    data=accounts.read_auth_map()
+  except Exception:
+    data={}
+  by_hash={}
+  for aid,entry in (data or {}).items():
+    if not isinstance(entry,dict): continue
+    sso=str(entry.get('sso') or entry.get('sso_cookie') or '').strip()
+    if sso: by_hash[_sha(sso)]=str(aid)
+  if not by_hash: return 0
+  ts=now(); changed=0
+  with LOCK, conn() as c:
+    for row in c.execute('SELECT id,sso_sha256 FROM account_credentials WHERE account_id IS NULL OR account_id=""').fetchall():
+      aid=by_hash.get(row['sso_sha256'])
+      if not aid: continue
+      cur=c.execute('UPDATE account_credentials SET account_id=?,status=?,updated_at=? WHERE id=?',(aid,'linked',ts,row['id']))
+      changed+=cur.rowcount
+    c.commit()
+  return changed
 def credential_summary():
+  reconcile_credentials_by_sso_hash()
   with LOCK, conn() as c:
     row=c.execute('SELECT count(*) total, sum(case when account_id is not null and account_id<>"" then 1 else 0 end) linked FROM account_credentials').fetchone()
     recent=[dict(x) for x in c.execute('SELECT id,task_id,email,account_id,status,given_name,family_name,source,created_at,updated_at FROM account_credentials ORDER BY id DESC LIMIT 50')]
@@ -184,7 +206,7 @@ def import_sso(r):
     failed=int((final or {}).get('fail') or (final or {}).get('failed') or 0)
     status=str((final or {}).get('status') or 'unknown')
     msg=(final or {}).get('message') or (final or {}).get('error') or status
-    linked=_bind_imported_accounts(int(r['id']), final)
+    linked=_bind_imported_accounts(int(r['id']), final) + reconcile_credentials_by_sso_hash()
     processed=len(new) if status in {'done','completed'} or imported or failed else 0
     update('UPDATE tasks SET hm_processed_count=hm_processed_count+?,hm_imported_count=hm_imported_count+?,hm_import_status=? WHERE id=?',processed,imported,(f"{status}: imported={imported} failed={failed} linked_credentials={linked} {msg}")[:1000],r['id'])
   except Exception as e:update('UPDATE tasks SET hm_import_status=? WHERE id=?',('error: '+str(e))[:1000],r['id'])
