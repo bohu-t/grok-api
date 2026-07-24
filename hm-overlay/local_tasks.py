@@ -142,8 +142,66 @@ def reconcile_credentials_by_sso_hash():
       changed+=cur.rowcount
     c.commit()
   return changed
+def reconcile_account_emails_from_credentials():
+  try:
+    from grok2api.pool import accounts
+    from grok2api.pool.auth_store import write_auth_map
+    data=accounts.read_auth_map()
+  except Exception:
+    return 0
+  if not isinstance(data,dict) or not data: return 0
+  with LOCK, conn() as c:
+    rows=[dict(x) for x in c.execute('SELECT account_id,email FROM account_credentials WHERE account_id IS NOT NULL AND account_id<>"" AND email IS NOT NULL AND email<>""')]
+  by_id={str(x.get('account_id')):str(x.get('email') or '').strip() for x in rows if x.get('account_id') and x.get('email')}
+  changed=0
+  for aid,email in by_id.items():
+    entry=data.get(aid)
+    if isinstance(entry,dict) and email and not str(entry.get('email') or '').strip():
+      entry['email']=email
+      entry.setdefault('name', email)
+      changed+=1
+  if changed:
+    try: write_auth_map(data)
+    except Exception: return 0
+  return changed
+def _imported_account_ids(final:dict[str,Any]|None):
+  out=[]; seen=set()
+  for seq in ((final or {}).get('imported') or [], (final or {}).get('results') or []):
+    for item in seq:
+      if not isinstance(item,dict): continue
+      aid=str(item.get('id') or item.get('account_id') or '').strip()
+      if aid and aid not in seen:
+        seen.add(aid); out.append(aid)
+  return out
+def _probe_delete_bad_imports(final:dict[str,Any]|None):
+  ids=_imported_account_ids(final)
+  if not ids: return {'checked':0,'deleted':0}
+  try:
+    import grok2api.admin.admin_routes as ar
+    from grok2api.pool import accounts as pool_accounts
+  except Exception as e:
+    return {'checked':0,'deleted':0,'error':str(e)[:200]}
+  deleted=[]; kept=[]; errors=[]
+  for aid in ids:
+    ok=False; err=''
+    try:
+      res=ar.model_health.probe_single_account(aid, None, auto_disable=False, source='post_import')
+      ok=bool(isinstance(res,dict) and res.get('ok'))
+      if not ok: err=str((res or {}).get('error') or (res or {}).get('message') or 'probe failed')[:300]
+    except Exception as e:
+      err=str(e)[:300]
+    if ok:
+      kept.append(aid); continue
+    try:
+      pool_accounts.remove_account(aid)
+      deleted.append(aid)
+      with LOCK, conn() as c:
+        c.execute('UPDATE account_credentials SET status=?,updated_at=? WHERE account_id=?',('deleted_probe_failed',now(),aid)); c.commit()
+    except Exception as e:
+      errors.append({'id':aid,'error':str(e)[:200]})
+  return {'checked':len(ids),'kept':len(kept),'deleted':len(deleted),'errors':errors[:5]}
 def credential_summary():
-  reconcile_credentials_by_sso_hash()
+  reconcile_credentials_by_sso_hash(); reconcile_account_emails_from_credentials()
   with LOCK, conn() as c:
     row=c.execute('SELECT count(*) total, sum(case when account_id is not null and account_id<>"" then 1 else 0 end) linked FROM account_credentials').fetchone()
     recent=[dict(x) for x in c.execute('SELECT id,task_id,email,account_id,status,given_name,family_name,source,created_at,updated_at FROM account_credentials ORDER BY id DESC LIMIT 50')]
@@ -178,7 +236,7 @@ def import_sso(r):
   ingest_credentials(r)
   p=Path(r['task_dir'])/'sso'/f"task_{r['id']}.txt"
   if not p.exists(): return
-  lines=[x.strip().split('----')[-1] for x in p.read_text(errors='replace').splitlines() if x.strip()]
+  lines=[x.strip() for x in p.read_text(errors='replace').splitlines() if x.strip()]
   done=int(r['hm_processed_count'] or 0); new=lines[done:]
   if not new:return
   try:
@@ -206,7 +264,7 @@ def import_sso(r):
     failed=int((final or {}).get('fail') or (final or {}).get('failed') or 0)
     status=str((final or {}).get('status') or 'unknown')
     msg=(final or {}).get('message') or (final or {}).get('error') or status
-    linked=_bind_imported_accounts(int(r['id']), final) + reconcile_credentials_by_sso_hash()
+    linked=_bind_imported_accounts(int(r['id']), final) + reconcile_credentials_by_sso_hash() + reconcile_account_emails_from_credentials() + reconcile_account_emails_from_credentials()
     processed=len(new) if status in {'done','completed'} or imported or failed else 0
     update('UPDATE tasks SET hm_processed_count=hm_processed_count+?,hm_imported_count=hm_imported_count+?,hm_import_status=? WHERE id=?',processed,imported,(f"{status}: imported={imported} failed={failed} linked_credentials={linked} {msg}")[:1000],r['id'])
   except Exception as e:update('UPDATE tasks SET hm_import_status=? WHERE id=?',('error: '+str(e))[:1000],r['id'])
@@ -222,7 +280,7 @@ def loop():
         r=one(tid);x=parse(r);update('UPDATE tasks SET completed_count=?,failed_count=?,current_round=?,current_phase=?,last_email=?,last_error=? WHERE id=?',x['completed_count'],x['failed_count'],x['current_round'],x['current_phase'],x['last_email'],x['last_error'],tid);import_sso(one(tid))
         code=p.poll()
         if code is not None:
-          status='stopped' if r['status']=='stopping' else ('completed' if code==0 and x['completed_count']>=r['target_count'] else ('partial' if x['completed_count'] else 'failed'))
+          status='stopped' if r['status']=='stopping' else ('completed' if code==0 and (x['completed_count']+x['failed_count'])>=r['target_count'] else ('partial' if x['completed_count'] else 'failed'))
           update('UPDATE tasks SET status=?,finished_at=?,exit_code=?,current_phase=? WHERE id=?',status,now(),code,status,tid);import_sso(one(tid));RUNNING.pop(tid,None)
       slots=max(1,int(os.getenv('GROK2API_LOCAL_TASK_WORKERS','1')))-len(RUNNING)
       if slots>0:
