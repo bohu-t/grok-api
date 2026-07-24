@@ -15,6 +15,7 @@ COPY requirements.txt /tmp/local-task-requirements.txt
 RUN pip install --no-cache-dir -r /tmp/local-task-requirements.txt
 COPY hm-overlay/hm_app.py /app/grok2api/app.py
 COPY hm-overlay/local_tasks.py /app/grok2api/admin/local_tasks.py
+COPY hm-overlay/admin_routes.py /app/grok2api/admin/admin_routes.py
 COPY hm-overlay/static/admin/register-tasks.html /app/static/admin/register-tasks.html
 COPY hm-overlay/static/admin-task-bridge.js /app/static/admin-task-bridge.js
 COPY hm-overlay/DrissionPage_example.py hm-overlay/email_register.py hm-overlay/config.example.json /opt/local-register-source/
