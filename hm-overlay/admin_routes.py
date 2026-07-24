@@ -85,22 +85,32 @@ def _split_registration_domains(value: Any) -> list[str]:
     return domains
 
 
+def _provider_domain_keys(provider: str) -> tuple[str, str]:
+    provider = str(provider or "moemail").lower()
+    if provider == "cfmail":
+        return "cfmail_domain", "cfmail_domains"
+    if provider == "yyds":
+        return "yyds_domain", "yyds_domains"
+    if provider == "gptmail":
+        return "gptmail_domain", "gptmail_domains"
+    return "moemail_domain", "moemail_domains"
+
+
 def _normalize_moemail_domains(cfg: dict[str, Any]) -> dict[str, Any]:
     provider = str(cfg.get("mail_provider") or cfg.get("provider") or "moemail").lower()
-    if provider != "moemail":
-        return cfg
+    single_key, list_key = _provider_domain_keys(provider)
     domains = _split_registration_domains(
-        cfg.get("moemail_domains")
+        cfg.get(list_key)
         or cfg.get("temp_mail_domains")
-        or cfg.get("moemail_domain")
+        or cfg.get(single_key)
         or cfg.get("temp_mail_domain")
         or cfg.get("domain")
     )
     if domains:
         joined = ", ".join(domains)
-        cfg["moemail_domains"] = domains
+        cfg[list_key] = domains
         cfg["temp_mail_domains"] = domains
-        cfg["moemail_domain"] = joined
+        cfg[single_key] = joined
         cfg["temp_mail_domain"] = joined
         cfg["domain"] = joined
     return cfg
@@ -108,13 +118,11 @@ def _normalize_moemail_domains(cfg: dict[str, Any]) -> dict[str, Any]:
 
 def _pick_moemail_domain(cfg: dict[str, Any]) -> str | None:
     provider = str(cfg.get("mail_provider") or "moemail").lower()
-    if provider != "moemail":
-        value = cfg.get("domain")
-        return str(value).strip() if value else None
+    single_key, list_key = _provider_domain_keys(provider)
     domains = _split_registration_domains(
-        cfg.get("moemail_domains")
+        cfg.get(list_key)
         or cfg.get("temp_mail_domains")
-        or cfg.get("moemail_domain")
+        or cfg.get(single_key)
         or cfg.get("temp_mail_domain")
         or cfg.get("domain")
     )
@@ -301,9 +309,12 @@ class EmailRegistrationBody(BaseModel):
     gptmail_api_key: str | None = Field(default=None, max_length=512)
     cfmail_api_key: str | None = Field(default=None, max_length=512)
     moemail_domain: str | None = Field(default=None, max_length=2048)
-    yyds_domain: str | None = Field(default=None, max_length=128)
-    gptmail_domain: str | None = Field(default=None, max_length=128)
-    cfmail_domain: str | None = Field(default=None, max_length=128)
+    yyds_domain: str | None = Field(default=None, max_length=2048)
+    yyds_domains: list[str] = Field(default_factory=list, max_length=200)
+    gptmail_domain: str | None = Field(default=None, max_length=2048)
+    gptmail_domains: list[str] = Field(default_factory=list, max_length=200)
+    cfmail_domain: str | None = Field(default=None, max_length=2048)
+    cfmail_domains: list[str] = Field(default_factory=list, max_length=200)
     captcha_provider: str | None = Field(
         default=None,
         pattern="^(local|yescaptcha)$",
@@ -409,8 +420,11 @@ class RegistrationConfigBody(BaseModel):
     moemail_domains: list[str] = Field(default_factory=list, max_length=200)
     temp_mail_domain: str | None = Field(default=None, max_length=2048)
     temp_mail_domains: list[str] = Field(default_factory=list, max_length=200)
-    yyds_domain: str | None = Field(default=None, max_length=128)
-    gptmail_domain: str | None = Field(default=None, max_length=128)
+    yyds_domain: str | None = Field(default=None, max_length=2048)
+    yyds_domains: list[str] = Field(default_factory=list, max_length=200)
+    gptmail_domain: str | None = Field(default=None, max_length=2048)
+    gptmail_domains: list[str] = Field(default_factory=list, max_length=200)
+    cfmail_domains: list[str] = Field(default_factory=list, max_length=200)
     prefix: str | None = Field(default=None, max_length=64)
     expiry_ms: int | None = Field(default=None, ge=0, le=259200000)
     captcha_provider: str | None = Field(
@@ -2084,8 +2098,11 @@ def _registration_cfg_from_body(body: EmailRegistrationBody | RegistrationConfig
         "temp_mail_domain": getattr(body, "temp_mail_domain", None),
         "temp_mail_domains": getattr(body, "temp_mail_domains", None),
         "yyds_domain": getattr(body, "yyds_domain", None),
+        "yyds_domains": getattr(body, "yyds_domains", None),
         "gptmail_domain": getattr(body, "gptmail_domain", None),
+        "gptmail_domains": getattr(body, "gptmail_domains", None),
         "cfmail_domain": getattr(body, "cfmail_domain", None),
+        "cfmail_domains": getattr(body, "cfmail_domains", None),
         "prefix": getattr(body, "prefix", None),
         "expiry_ms": getattr(body, "expiry_ms", None),
         "captcha_provider": getattr(body, "captcha_provider", None),

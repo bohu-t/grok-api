@@ -2991,8 +2991,11 @@ function readRegConfig() {
     moemail_domain: regMailDomains.moemail || "",
     moemail_domains: parseRegMailDomains(regMailDomains.moemail || ""),
     yyds_domain: regMailDomains.yyds || "",
+    yyds_domains: parseRegMailDomains(regMailDomains.yyds || ""),
     gptmail_domain: regMailDomains.gptmail || "",
+    gptmail_domains: parseRegMailDomains(regMailDomains.gptmail || ""),
     cfmail_domain: regMailDomains.cfmail || "",
+    cfmail_domains: parseRegMailDomains(regMailDomains.cfmail || ""),
     expiry_ms: $("reg-expiry-ms") ? $("reg-expiry-ms").value.trim() : "",
     // Active key + all per-provider keys (empty keeps previous secret server-side).
     api_key: activeKey,
@@ -3091,13 +3094,19 @@ function applyRegConfig(cfg) {
     cfmail: pickDomain("cfmail_domain", mailProv === "cfmail"),
   };
   // If server returned empty dedicated slot for active provider, force empty.
-  if (mailProv === "yyds" && Object.prototype.hasOwnProperty.call(cfg, "yyds_domain")) {
+  if (mailProv === "yyds" && Object.prototype.hasOwnProperty.call(cfg, "yyds_domains")) {
+    regMailDomains.yyds = Array.isArray(cfg.yyds_domains) ? cfg.yyds_domains.join(", ") : formatRegMailDomains(cfg.yyds_domains);
+  } else if (mailProv === "yyds" && Object.prototype.hasOwnProperty.call(cfg, "yyds_domain")) {
     regMailDomains.yyds = cfg.yyds_domain == null ? "" : String(cfg.yyds_domain);
   }
-  if (mailProv === "gptmail" && Object.prototype.hasOwnProperty.call(cfg, "gptmail_domain")) {
+  if (mailProv === "gptmail" && Object.prototype.hasOwnProperty.call(cfg, "gptmail_domains")) {
+    regMailDomains.gptmail = Array.isArray(cfg.gptmail_domains) ? cfg.gptmail_domains.join(", ") : formatRegMailDomains(cfg.gptmail_domains);
+  } else if (mailProv === "gptmail" && Object.prototype.hasOwnProperty.call(cfg, "gptmail_domain")) {
     regMailDomains.gptmail = cfg.gptmail_domain == null ? "" : String(cfg.gptmail_domain);
   }
-  if (mailProv === "cfmail" && Object.prototype.hasOwnProperty.call(cfg, "cfmail_domain")) {
+  if (mailProv === "cfmail" && Object.prototype.hasOwnProperty.call(cfg, "cfmail_domains")) {
+    regMailDomains.cfmail = Array.isArray(cfg.cfmail_domains) ? cfg.cfmail_domains.join(", ") : formatRegMailDomains(cfg.cfmail_domains);
+  } else if (mailProv === "cfmail" && Object.prototype.hasOwnProperty.call(cfg, "cfmail_domain")) {
     regMailDomains.cfmail = cfg.cfmail_domain == null ? "" : String(cfg.cfmail_domain);
   }
   if (mailProv === "moemail" && Object.prototype.hasOwnProperty.call(cfg, "moemail_domains")) {
@@ -3198,6 +3207,9 @@ async function saveRegConfig() {
     const mail = String(saved.mail_provider || cfg.mail_provider || "moemail").toLowerCase();
     if (mail === "yyds") {
       if (!Object.prototype.hasOwnProperty.call(saved, "yyds_domain")) saved.yyds_domain = cfg.yyds_domain || "";
+      if (!Object.prototype.hasOwnProperty.call(saved, "yyds_domains")) saved.yyds_domains = cfg.yyds_domains || parseRegMailDomains(cfg.yyds_domain || "");
+      if (!Object.prototype.hasOwnProperty.call(saved, "gptmail_domains")) saved.gptmail_domains = cfg.gptmail_domains || parseRegMailDomains(cfg.gptmail_domain || "");
+      if (!Object.prototype.hasOwnProperty.call(saved, "cfmail_domains")) saved.cfmail_domains = cfg.cfmail_domains || parseRegMailDomains(cfg.cfmail_domain || "");
       if (!Object.prototype.hasOwnProperty.call(saved, "domain")) saved.domain = cfg.domain || "";
       if (!Object.prototype.hasOwnProperty.call(saved, "yyds_api_key")) saved.yyds_api_key = cfg.yyds_api_key || "";
       if (!Object.prototype.hasOwnProperty.call(saved, "api_key")) saved.api_key = cfg.api_key || "";
