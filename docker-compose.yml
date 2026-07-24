@@ -1,4 +1,23 @@
 services:
+  warp:
+    image: caomingjun/warp:latest
+    container_name: grok-api-warp-1
+    restart: unless-stopped
+    environment:
+      WARP_SLEEP: "2"
+    cap_add:
+      - NET_ADMIN
+    networks:
+      default:
+        aliases:
+          - warp
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS --socks5-hostname 127.0.0.1:1080 https://www.cloudflare.com/cdn-cgi/trace >/dev/null || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
   redis:
     image: redis:7-alpine
     restart: unless-stopped
@@ -29,6 +48,40 @@ services:
       timeout: 5s
       retries: 10
 
+  grokcli-2api:
+    build:
+      context: .
+      dockerfile: hm-overlay/Dockerfile
+    image: grokcli-2api-local-tasks:latest
+    restart: unless-stopped
+    env_file:
+      - ./.env
+      - ./hm.runtime.env
+    environment:
+      TZ: Asia/Shanghai
+      GROK2API_HOST: "0.0.0.0"
+      GROK2API_PORT: "3000"
+      GROK2API_STORE_BACKEND: "hybrid"
+      GROK2API_REQUIRE_SHARED_STORES: "1"
+      GROK2API_WORKERS: "1"
+      GROK2API_PROXY_MODE: "single_proxy"
+      GROK2API_BASE_PROXY_URL: "socks5://warp:1080"
+      GROK2API_ASSET_PROXY_URL: "socks5://warp:1080"
+      GROK_REGISTER_DEFAULT_PROXY: "socks5://warp:1080"
+      GROK_REGISTER_DEFAULT_BROWSER_PROXY: "socks5://warp:1080"
+      REDIS_URL: "redis://redis:6379/0"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      warp:
+        condition: service_started
+
   console:
     build:
       context: .
@@ -36,6 +89,7 @@ services:
     image: grok2apiwarp-auto-console:latest
     container_name: grok2apiwarp-auto-console-1
     env_file:
+      - ./.env
       - ./hm.runtime.env
     environment:
       GROK_REGISTER_SOURCE_DIR: /workspace
@@ -44,32 +98,26 @@ services:
       GROK_REGISTER_CONSOLE_PORT: ${GROK_STACK_CONSOLE_PORT:-18600}
       GROK_REGISTER_CONSOLE_MAX_CONCURRENT_TASKS: 1
       GROK_REGISTER_DEFAULT_RUN_COUNT: ${GROK_REGISTER_DEFAULT_RUN_COUNT:-50}
-      GROK_REGISTER_DEFAULT_PROXY: socks5://127.0.0.1:1081
-      GROK_REGISTER_DEFAULT_BROWSER_PROXY: socks5://127.0.0.1:1081
-      GROK2API_HOST: 127.0.0.1
+      GROK_REGISTER_DEFAULT_PROXY: socks5://warp:1080
+      GROK_REGISTER_DEFAULT_BROWSER_PROXY: socks5://warp:1080
+      GROK2API_HOST: grokcli-2api
       GROK2API_PORT: 3000
       REDIS_URL: redis://redis:6379/0
     ports:
       - "${GROK_STACK_CONSOLE_PORT:-18600}:18600"
     volumes:
       - .:/workspace
-      - /opt/grokcli-2api/data:/app/data
+      - ./data:/app/data
     restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy
       postgres:
         condition: service_healthy
-    networks:
-      - default
-      - warp_proxy
+      warp:
+        condition: service_started
+      grokcli-2api:
+        condition: service_started
 
 volumes:
   grok2api_pg:
-    external: true
-    name: grokcli-2api_grok2api_pg
-
-networks:
-  warp_proxy:
-    external: true
-    name: warp-proxy_default
