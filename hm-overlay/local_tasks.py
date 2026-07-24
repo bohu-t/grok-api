@@ -176,13 +176,22 @@ def get_settings(_:str=Depends(require_admin)):
 def save_settings(payload:dict[str,Any],_:str=Depends(require_admin)):
   ensure_started()
   allowed={'proxy','browser_proxy','temp_mail_api_base','temp_mail_admin_password','temp_mail_domain','temp_mail_domains','temp_mail_site_password'}
+  current=defaults()
   saved={k:v for k,v in payload.items() if k in allowed}
+  # Password inputs are intentionally not echoed to the browser.  If the user
+  # saves the form with those fields blank, preserve the existing secrets
+  # instead of overwriting them with empty strings.
+  for secret_key in ('temp_mail_admin_password','temp_mail_site_password'):
+    if str(saved.get(secret_key) or '') == '' and current.get(secret_key):
+      saved[secret_key]=current.get(secret_key)
   domains=split_mail_domains(saved.get('temp_mail_domains') or saved.get('temp_mail_domain'))
   saved['temp_mail_domains']=domains
   saved['temp_mail_domain']=', '.join(domains)
-  saved={k:(v if isinstance(v,list) else str(v or '')) for k,v in saved.items()}
+  merged={k:current.get(k,'') for k in allowed if k in current}
+  merged.update(saved)
+  merged={k:(v if isinstance(v,list) else str(v or '')) for k,v in merged.items()}
   with LOCK, conn() as c:
-    c.execute("INSERT INTO task_settings(key,value) VALUES('defaults',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(saved,ensure_ascii=False),))
+    c.execute("INSERT INTO task_settings(key,value) VALUES('defaults',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(merged,ensure_ascii=False),))
     c.commit()
   return {'settings':defaults()}
 
