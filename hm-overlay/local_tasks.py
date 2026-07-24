@@ -30,8 +30,23 @@ class TaskCreate(BaseModel):
     temp_mail_api_base: str = ""
     temp_mail_admin_password: str = ""
     temp_mail_domain: str = ""
+    temp_mail_domains: list[str] = Field(default_factory=list)
     temp_mail_site_password: str = ""
     notes: str = Field(default="", max_length=500)
+
+def split_mail_domains(value: Any) -> list[str]:
+  raw=[]
+  if isinstance(value, str): raw=re.split(r"[,;\s]+", value)
+  elif isinstance(value, (list, tuple, set)):
+    for item in value: raw.extend(re.split(r"[,;\s]+", str(item or "")))
+  elif value is not None: raw=re.split(r"[,;\s]+", str(value))
+  out=[]; seen=set()
+  for item in raw:
+    domain=str(item or "").strip().lstrip("@")
+    key=domain.lower()
+    if key and key not in seen:
+      out.append(domain); seen.add(key)
+  return out
 
 def now(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 def conn():
@@ -114,6 +129,9 @@ def defaults():
     except Exception:pass
   d['proxy']=d.get('proxy') or os.getenv('GROK_REGISTER_DEFAULT_PROXY','socks5://127.0.0.1:1081')
   d['browser_proxy']=d.get('browser_proxy') or os.getenv('GROK_REGISTER_DEFAULT_BROWSER_PROXY','socks5://127.0.0.1:1081')
+  domains=split_mail_domains(d.get('temp_mail_domains') or d.get('temp_mail_domain'))
+  d['temp_mail_domains']=domains
+  d['temp_mail_domain']=', '.join(domains)
   return d
 @router.get('/meta')
 def meta(_:str=Depends(require_admin)): ensure_started();return {'defaults':defaults()}
@@ -121,7 +139,7 @@ def meta(_:str=Depends(require_admin)): ensure_started();return {'defaults':defa
 def list_tasks(_:str=Depends(require_admin)): ensure_started();return {'tasks':[ser(r) for r in rows('SELECT * FROM tasks ORDER BY id DESC')]}
 @router.post('')
 def create(p:TaskCreate,_:str=Depends(require_admin)):
-  ensure_started();cfg=defaults();cfg.update({k:v for k,v in p.model_dump().items() if k in cfg and v});cfg['api']={'endpoint':'','token':'','append':True};cfg.setdefault('run',{})['count']=p.count
+  ensure_started();cfg=defaults();payload=p.model_dump();cfg.update({k:v for k,v in payload.items() if k in cfg and v});domains=split_mail_domains(payload.get('temp_mail_domains') or payload.get('temp_mail_domain') or cfg.get('temp_mail_domains') or cfg.get('temp_mail_domain'));cfg['temp_mail_domains']=domains;cfg['temp_mail_domain']=', '.join(domains);cfg['api']={'endpoint':'','token':'','append':True};cfg.setdefault('run',{})['count']=p.count
   with LOCK,conn() as c:
     cur=c.execute('INSERT INTO tasks(name,status,target_count,notes,config_json,task_dir,console_path,created_at) VALUES(?,?,?,?,?,?,?,?)',(p.name,'creating',p.count,p.notes,json.dumps(cfg,ensure_ascii=False),'pending','pending',now()));tid=cur.lastrowid;d=DATA/f'task_{tid}';c.execute('UPDATE tasks SET status=?,task_dir=?,console_path=? WHERE id=?',('queued',str(d),str(d/'console.log'),tid));c.commit()
   return {'task':ser(one(tid))}
@@ -157,8 +175,12 @@ def get_settings(_:str=Depends(require_admin)):
 @router.post('/settings')
 def save_settings(payload:dict[str,Any],_:str=Depends(require_admin)):
   ensure_started()
-  allowed={'proxy','browser_proxy','temp_mail_api_base','temp_mail_admin_password','temp_mail_domain','temp_mail_site_password'}
-  saved={k:str(v or '') for k,v in payload.items() if k in allowed}
+  allowed={'proxy','browser_proxy','temp_mail_api_base','temp_mail_admin_password','temp_mail_domain','temp_mail_domains','temp_mail_site_password'}
+  saved={k:v for k,v in payload.items() if k in allowed}
+  domains=split_mail_domains(saved.get('temp_mail_domains') or saved.get('temp_mail_domain'))
+  saved['temp_mail_domains']=domains
+  saved['temp_mail_domain']=', '.join(domains)
+  saved={k:(v if isinstance(v,list) else str(v or '')) for k,v in saved.items()}
   with LOCK, conn() as c:
     c.execute("INSERT INTO task_settings(key,value) VALUES('defaults',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(saved,ensure_ascii=False),))
     c.commit()

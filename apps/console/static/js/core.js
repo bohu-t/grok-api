@@ -2911,7 +2911,7 @@ function syncRegMailProviderUI() {
         ? "GPTMail 邮箱域名"
         : isCf
           ? "CF Temp Email 域名"
-          : "MoeMail 邮箱域名";
+          : "MoeMail 邮箱域名（支持多个）";
   }
   if ($("reg-domain")) {
     $("reg-domain").placeholder = isYyds
@@ -2920,7 +2920,7 @@ function syncRegMailProviderUI() {
         ? "可选；留空由 GPTMail 随机分配"
         : isCf
           ? "可选；留空从 /open_api/settings 自动选"
-          : "example.com";
+          : "a.example.com, b.example.com 或每行一个";
     // Show the domain stored for this provider only.
     $("reg-domain").value = regMailDomains[mail] || "";
   }
@@ -2941,6 +2941,25 @@ function syncRegMailProviderUI() {
       }
     }
   }
+}
+
+function parseRegMailDomains(value) {
+  const raw = value == null ? "" : String(value);
+  const seen = new Set();
+  const domains = [];
+  raw.split(/[,;\s]+/).forEach((part) => {
+    const domain = String(part || "").trim().replace(/^@+/, "");
+    const key = domain.toLowerCase();
+    if (key && !seen.has(key)) {
+      seen.add(key);
+      domains.push(domain);
+    }
+  });
+  return domains;
+}
+
+function formatRegMailDomains(value) {
+  return parseRegMailDomains(value).join(", ");
 }
 
 function readRegConfig() {
@@ -2970,6 +2989,7 @@ function readRegConfig() {
     cfmail_base_url: regMailBaseUrls.cfmail || "",
     domain: activeDomain,
     moemail_domain: regMailDomains.moemail || "",
+    moemail_domains: parseRegMailDomains(regMailDomains.moemail || ""),
     yyds_domain: regMailDomains.yyds || "",
     gptmail_domain: regMailDomains.gptmail || "",
     cfmail_domain: regMailDomains.cfmail || "",
@@ -3080,7 +3100,11 @@ function applyRegConfig(cfg) {
   if (mailProv === "cfmail" && Object.prototype.hasOwnProperty.call(cfg, "cfmail_domain")) {
     regMailDomains.cfmail = cfg.cfmail_domain == null ? "" : String(cfg.cfmail_domain);
   }
-  if (mailProv === "moemail" && Object.prototype.hasOwnProperty.call(cfg, "moemail_domain")) {
+  if (mailProv === "moemail" && Object.prototype.hasOwnProperty.call(cfg, "moemail_domains")) {
+    regMailDomains.moemail = Array.isArray(cfg.moemail_domains)
+      ? cfg.moemail_domains.join(", ")
+      : formatRegMailDomains(cfg.moemail_domains);
+  } else if (mailProv === "moemail" && Object.prototype.hasOwnProperty.call(cfg, "moemail_domain")) {
     regMailDomains.moemail = cfg.moemail_domain == null ? "" : String(cfg.moemail_domain);
   }
   regMailProviderPrev = mailProv;
@@ -3193,6 +3217,7 @@ async function saveRegConfig() {
       if (!Object.prototype.hasOwnProperty.call(saved, "moemail_base_url")) saved.moemail_base_url = cfg.moemail_base_url || "";
     } else {
       if (!Object.prototype.hasOwnProperty.call(saved, "moemail_domain")) saved.moemail_domain = cfg.moemail_domain || "";
+      if (!Object.prototype.hasOwnProperty.call(saved, "moemail_domains")) saved.moemail_domains = cfg.moemail_domains || parseRegMailDomains(cfg.moemail_domain || cfg.domain || "");
       if (!Object.prototype.hasOwnProperty.call(saved, "domain")) saved.domain = cfg.domain || "";
       if (!Object.prototype.hasOwnProperty.call(saved, "base_url")) saved.base_url = cfg.base_url || "";
       if (!Object.prototype.hasOwnProperty.call(saved, "moemail_base_url")) saved.moemail_base_url = cfg.moemail_base_url || cfg.base_url || "";
@@ -3300,6 +3325,9 @@ function buildRegBody(config) {
   if (body.mail_provider === "moemail") {
     body.moemail_api_key = config.moemail_api_key == null ? body.api_key : String(config.moemail_api_key);
     body.moemail_domain = config.moemail_domain == null ? body.domain : String(config.moemail_domain);
+    body.moemail_domains = parseRegMailDomains(body.moemail_domain);
+    body.temp_mail_domain = body.moemail_domain;
+    body.temp_mail_domains = body.moemail_domains;
   } else if (body.mail_provider === "yyds") {
     body.yyds_api_key = config.yyds_api_key == null ? body.api_key : String(config.yyds_api_key);
     body.yyds_domain = config.yyds_domain == null ? body.domain : String(config.yyds_domain);
