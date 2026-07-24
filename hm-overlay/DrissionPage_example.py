@@ -141,6 +141,7 @@ SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
 _sso_dir = os.path.join(os.path.dirname(__file__), "sso")
 _sso_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 DEFAULT_SSO_FILE = os.path.join(_sso_dir, f"sso_{_sso_ts}.txt")
+DEFAULT_CREDENTIALS_FILE = os.path.join(_sso_dir, f"credentials_{_sso_ts}.jsonl")
 
 
 def start_browser():
@@ -1059,17 +1060,38 @@ def wait_for_sso_cookie(timeout=30):
     raise Exception(f"注册完成后未获取到 sso cookie，当前已见 cookie: {sorted(last_seen_names)}")
 
 
-def append_sso_to_txt(sso_value, output_path=DEFAULT_SSO_FILE):
-    # 按用户要求，一行写一个 sso 值，持续追加。
+def append_sso_to_txt(sso_value, output_path=DEFAULT_SSO_FILE, email=""):
+    # 一行写一个 SSO；若有 email，用 email----sso 方便导入后回绑凭据。
     normalized = str(sso_value or "").strip()
+    email = str(email or "").strip()
     if not normalized:
         raise Exception("待写入的 sso 为空")
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "a", encoding="utf-8") as file:
-        file.write(normalized + "\n")
+        file.write((f"{email}----{normalized}" if email else normalized) + "\n")
 
     print(f"[*] 已追加写入 sso 到文件: {output_path}")
+
+
+def append_credentials_to_jsonl(record, output_path=DEFAULT_CREDENTIALS_FILE):
+    # 机器可读凭据文件只用于 local_tasks 立即加密入库。不要把密码写进普通日志。
+    import json
+    safe_record = {
+        "email": str(record.get("email") or "").strip(),
+        "password": str(record.get("password") or ""),
+        "given_name": str(record.get("given_name") or ""),
+        "family_name": str(record.get("family_name") or ""),
+        "sso": str(record.get("sso") or "").strip(),
+        "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "source": "local-browser-register",
+    }
+    if not safe_record["email"] or not safe_record["password"] or not safe_record["sso"]:
+        raise Exception("凭据记录缺少 email/password/sso，拒绝写入")
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "a", encoding="utf-8") as file:
+        file.write(json.dumps(safe_record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    print(f"[*] 已写入凭据索引，等待本地任务服务加密入库: {output_path}")
 
 
 def push_sso_to_api(new_tokens: list):
@@ -1172,7 +1194,7 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
     fill_code_and_submit(email, dev_token)
     profile = fill_profile_and_submit()
     sso_value = wait_for_sso_cookie()
-    append_sso_to_txt(sso_value, output_path)
+    append_sso_to_txt(sso_value, output_path, email=email)
 
     if extract_numbers:
         extract_visible_numbers()
@@ -1182,12 +1204,12 @@ def run_single_registration(output_path=DEFAULT_SSO_FILE, extract_numbers=False)
         "sso": sso_value,
         **profile,
     }
+    append_credentials_to_jsonl(result)
 
     if run_logger:
         run_logger.info(
-            "注册成功 | email=%s | password=%s | given=%s | family=%s",
+            "注册成功 | email=%s | password=<saved> | given=%s | family=%s",
             email,
-            profile.get("password", ""),
             profile.get("given_name", ""),
             profile.get("family_name", ""),
         )

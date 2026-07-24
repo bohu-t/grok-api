@@ -1,10 +1,11 @@
 """Local browser-registration tasks embedded in the HM admin service."""
 from __future__ import annotations
-import json, os, re, shutil, signal, sqlite3, subprocess, threading, time
+import hashlib, json, os, re, shutil, signal, sqlite3, subprocess, threading, time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 import requests
+from cryptography.fernet import Fernet
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from grok2api.admin.admin_routes import require_admin
@@ -13,6 +14,7 @@ from grok2api.admin.settings_store import create_session_token
 router = APIRouter(prefix="/admin/api/local-tasks", tags=["local-tasks"])
 DATA = Path("/app/data/local-tasks")
 DB = DATA / "local-tasks.db"
+CRED_KEY = DATA / "credential.key"
 SRC = Path("/opt/local-register-source")
 LOCK = threading.RLock()
 RUNNING: dict[int, subprocess.Popen] = {}
@@ -57,7 +59,73 @@ def init():
     with LOCK, conn() as c:
       c.execute('''CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,status TEXT NOT NULL,target_count INTEGER NOT NULL,completed_count INTEGER NOT NULL DEFAULT 0,failed_count INTEGER NOT NULL DEFAULT 0,current_round INTEGER NOT NULL DEFAULT 0,current_phase TEXT,last_email TEXT,last_error TEXT,notes TEXT,config_json TEXT NOT NULL,task_dir TEXT NOT NULL,console_path TEXT NOT NULL,pid INTEGER,created_at TEXT NOT NULL,started_at TEXT,finished_at TEXT,exit_code INTEGER,hm_imported_count INTEGER NOT NULL DEFAULT 0,hm_processed_count INTEGER NOT NULL DEFAULT 0,hm_import_status TEXT)''')
       c.execute('CREATE TABLE IF NOT EXISTS task_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+      c.execute('''CREATE TABLE IF NOT EXISTS account_credentials(id INTEGER PRIMARY KEY AUTOINCREMENT,task_id INTEGER,email TEXT NOT NULL,email_lc TEXT NOT NULL,password_enc TEXT NOT NULL,sso_sha256 TEXT NOT NULL,account_id TEXT,status TEXT NOT NULL DEFAULT 'stored',given_name TEXT,family_name TEXT,source TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,UNIQUE(email_lc,sso_sha256))''')
+      c.execute('CREATE INDEX IF NOT EXISTS idx_account_credentials_account_id ON account_credentials(account_id)')
+      c.execute('CREATE INDEX IF NOT EXISTS idx_account_credentials_sso_sha256 ON account_credentials(sso_sha256)')
       c.commit()
+def _fernet():
+  DATA.mkdir(parents=True,exist_ok=True)
+  if not CRED_KEY.exists():
+    CRED_KEY.write_bytes(Fernet.generate_key())
+    try: CRED_KEY.chmod(0o600)
+    except Exception: pass
+  return Fernet(CRED_KEY.read_bytes().strip())
+def _enc(v:str)->str: return _fernet().encrypt(str(v or '').encode()).decode()
+def _sha(v:str)->str: return hashlib.sha256(str(v or '').strip().encode()).hexdigest()
+def _load_credentials_lines(task_dir:str):
+  root=Path(task_dir)/'sso'
+  if not root.exists(): return []
+  out=[]
+  for path in sorted(root.glob('credentials_*.jsonl')):
+    try:
+      for ln in path.read_text(errors='replace').splitlines():
+        if not ln.strip(): continue
+        try: out.append(json.loads(ln))
+        except Exception: pass
+      # Remove plaintext after best-effort read; encrypted SQLite is source of truth.
+      path.write_text('', encoding='utf-8')
+    except Exception: pass
+  return out
+def ingest_credentials(r):
+  try:
+    records=_load_credentials_lines(r['task_dir'])
+    if not records: return 0
+    ts=now(); n=0
+    with LOCK, conn() as c:
+      for rec in records:
+        email=str(rec.get('email') or '').strip(); pwd=str(rec.get('password') or '')
+        sso=str(rec.get('sso') or '').strip()
+        if not email or not pwd or not sso: continue
+        c.execute("""INSERT INTO account_credentials(task_id,email,email_lc,password_enc,sso_sha256,account_id,status,given_name,family_name,source,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(email_lc,sso_sha256) DO UPDATE SET password_enc=excluded.password_enc,given_name=excluded.given_name,family_name=excluded.family_name,source=excluded.source,updated_at=excluded.updated_at""",(int(r['id']),email,email.lower(),_enc(pwd),_sha(sso),None,'stored',str(rec.get('given_name') or ''),str(rec.get('family_name') or ''),str(rec.get('source') or 'local-browser-register'),ts,ts))
+        n+=1
+      c.commit()
+    return n
+  except Exception:
+    return 0
+def _bind_imported_accounts(task_id:int, final:dict[str,Any]|None):
+  imported=(final or {}).get('imported') or []
+  results=(final or {}).get('results') or []
+  ts=now(); changed=0
+  with LOCK, conn() as c:
+    for item in results:
+      if not isinstance(item,dict) or item.get('status')!='ok': continue
+      email=str(item.get('email') or '').strip().lower(); aid=str(item.get('account_id') or '').strip()
+      if not email or not aid: continue
+      cur=c.execute('UPDATE account_credentials SET account_id=?,status=?,updated_at=? WHERE task_id=? AND email_lc=? AND (account_id IS NULL OR account_id="")',(aid,'linked',ts,task_id,email))
+      changed+=cur.rowcount
+    for item in imported:
+      if not isinstance(item,dict): continue
+      email=str(item.get('email') or '').strip().lower(); aid=str(item.get('id') or '').strip()
+      if not email or not aid: continue
+      cur=c.execute('UPDATE account_credentials SET account_id=?,status=?,updated_at=? WHERE task_id=? AND email_lc=? AND (account_id IS NULL OR account_id="")',(aid,'linked',ts,task_id,email))
+      changed+=cur.rowcount
+    c.commit()
+  return changed
+def credential_summary():
+  with LOCK, conn() as c:
+    row=c.execute('SELECT count(*) total, sum(case when account_id is not null and account_id<>"" then 1 else 0 end) linked FROM account_credentials').fetchone()
+    recent=[dict(x) for x in c.execute('SELECT id,task_id,email,account_id,status,given_name,family_name,source,created_at,updated_at FROM account_credentials ORDER BY id DESC LIMIT 50')]
+  return {'total':int(row['total'] or 0),'linked':int(row['linked'] or 0),'recent':recent}
 def rows(sql,*args):
   with LOCK,conn() as c:return c.execute(sql,args).fetchall()
 def one(i):
@@ -85,6 +153,7 @@ def source_copy(dst,cfg):
   (dst/'logs').mkdir(exist_ok=True);(dst/'sso').mkdir(exist_ok=True)
   (dst/'config.json').write_text(json.dumps(cfg,ensure_ascii=False,indent=2))
 def import_sso(r):
+  ingest_credentials(r)
   p=Path(r['task_dir'])/'sso'/f"task_{r['id']}.txt"
   if not p.exists(): return
   lines=[x.strip().split('----')[-1] for x in p.read_text(errors='replace').splitlines() if x.strip()]
@@ -115,8 +184,9 @@ def import_sso(r):
     failed=int((final or {}).get('fail') or (final or {}).get('failed') or 0)
     status=str((final or {}).get('status') or 'unknown')
     msg=(final or {}).get('message') or (final or {}).get('error') or status
+    linked=_bind_imported_accounts(int(r['id']), final)
     processed=len(new) if status in {'done','completed'} or imported or failed else 0
-    update('UPDATE tasks SET hm_processed_count=hm_processed_count+?,hm_imported_count=hm_imported_count+?,hm_import_status=? WHERE id=?',processed,imported,(f"{status}: imported={imported} failed={failed} {msg}")[:1000],r['id'])
+    update('UPDATE tasks SET hm_processed_count=hm_processed_count+?,hm_imported_count=hm_imported_count+?,hm_import_status=? WHERE id=?',processed,imported,(f"{status}: imported={imported} failed={failed} linked_credentials={linked} {msg}")[:1000],r['id'])
   except Exception as e:update('UPDATE tasks SET hm_import_status=? WHERE id=?',('error: '+str(e))[:1000],r['id'])
 def start(r):
   dst=Path(r['task_dir']);cfg=json.loads(r['config_json']);source_copy(dst,cfg)
@@ -216,6 +286,10 @@ def save_settings(payload:dict[str,Any],_:str=Depends(require_admin)):
     c.execute("INSERT INTO task_settings(key,value) VALUES('defaults',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(merged,ensure_ascii=False),))
     c.commit()
   return {'settings':defaults()}
+
+@router.get('/credentials')
+def credentials(_:str=Depends(require_admin)):
+  ensure_started(); return credential_summary()
 
 @router.get('/tasks/{tid}')
 def get_task_compat(tid:int,_:str=Depends(require_admin)):
